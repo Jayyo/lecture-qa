@@ -135,12 +135,8 @@ function showToast(message, type = 'default') {
     }, 3000);
 }
 
-// Upload handlers
-uploadBox.addEventListener('click', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    videoInput.click();
-});
+// Upload handlers - using label[for] natively triggers file input
+// No click handler needed for uploadBox since it's now a <label for="videoInput">
 
 videoInput.addEventListener('change', async (e) => {
     const file = e.target.files[0];

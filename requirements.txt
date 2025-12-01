@@ -8,3 +8,7 @@ yt-dlp>=2024.11.18
 python-dotenv==1.0.0
 gunicorn==21.2.0
 requests>=2.32.2
+
+# Local Whisper (optional - for offline transcription)
+openai-whisper>=20240930
+torch>=2.0.0

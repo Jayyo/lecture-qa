@@ -11,6 +11,9 @@ services:
     environment:
       - FLASK_ENV=production
       - TZ=Asia/Seoul
+      # Local Whisper settings (uncomment to enable)
+      # - USE_LOCAL_WHISPER=true
+      # - WHISPER_MODEL=small  # tiny, base, small, medium, large
     volumes:
       - ./uploads:/app/uploads
       - ./transcripts:/app/transcripts
@@ -21,6 +24,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Increase shared memory for PyTorch (needed for Whisper)
+    shm_size: '2gb'
 
   caddy:
     image: caddy:2

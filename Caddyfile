@@ -1,0 +1,3 @@
+lectureqa.duckdns.org {
+    reverse_proxy lecture-qa:5000
+}

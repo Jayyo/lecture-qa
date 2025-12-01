@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>실시간 강의 Q&A</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-top">
+                <div class="header-spacer"></div>
+                <h1>실시간 강의 Q&A</h1>
+                <div class="user-menu" id="userMenu">
+                    <!-- Filled by JS -->
+                </div>
+            </div>
+            <p class="subtitle">강의 영상을 업로드하고 AI와 대화하세요</p>
+        </header>
+
+        <!-- Upload Section -->
+        <section class="upload-section" id="uploadSection">
+            <div class="upload-box" id="uploadBox">
+                <div class="upload-content">
+                    <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="17 8 12 3 7 8"/>
+                        <line x1="12" y1="3" x2="12" y2="15"/>
+                    </svg>
+                    <p class="upload-text">클릭하여 동영상 업로드</p>
+                    <p class="upload-hint">또는 YouTube URL 입력</p>
+                </div>
+                <input type="file" id="videoInput" accept="video/*" hidden>
+            </div>
+
+            <!-- YouTube URL Input -->
+            <div class="url-input-section">
+                <div class="url-input-wrapper">
+                    <input type="text" id="youtubeUrl" placeholder="YouTube URL을 입력하세요" class="url-input">
+                    <button id="loadYoutube" class="btn btn-primary">불러오기</button>
+                </div>
+                <p class="duration-hint">* 5분 이하의 영상만 지원됩니다</p>
+            </div>
+        </section>
+
+        <!-- Video Section (hidden initially) -->
+        <section class="video-section" id="videoSection" style="display: none;">
+            <div class="video-wrapper">
+                <!-- Video Container -->
+                <div class="video-container" id="videoContainer">
+                    <video id="videoPlayer" controls>
+                        <source src="" type="video/mp4">
+                    </video>
+
+                    <!-- Answer Overlay -->
+                    <div class="answer-overlay" id="answerOverlay">
+                        <div class="answer-content">
+                            <div class="answer-header">
+                                <span class="answer-label">AI 답변</span>
+                                <button class="close-answer" id="closeAnswer">×</button>
+                            </div>
+                            <div class="answer-text" id="answerText"></div>
+                            <div class="feedback-buttons" id="feedbackButtons">
+                                <button class="feedback-btn thumbs-up" id="thumbsUp" title="만족 - 영상 이어보기">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
+                                    </svg>
+                                    <span>만족</span>
+                                </button>
+                                <button class="feedback-btn thumbs-down" id="thumbsDown" title="불만족 - 교수님께 문의">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
+                                    </svg>
+                                    <span>불만족</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Transcription Progress -->
+                    <div class="transcription-overlay" id="transcriptionOverlay">
+                        <div class="transcription-content">
+                            <div class="spinner"></div>
+                            <p class="transcription-status" id="transcriptionStatus">영상을 분석하고 있습니다...</p>
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progressFill"></div>
+                            </div>
+                            <p class="progress-text" id="progressText">0%</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- New Video Button -->
+                <button class="btn btn-new-video" id="newVideoBtn">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"/>
+                        <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                    새 영상
+                </button>
+            </div>
+
+            <!-- Chat Section -->
+            <div class="chat-section">
+                <div class="chat-messages" id="chatMessages">
+                    <div class="welcome-message">
+                        <p>강의 내용에 대해 궁금한 점을 질문해주세요!</p>
+                        <p class="hint">질문하면 영상이 자동으로 일시정지됩니다.</p>
+                    </div>
+                </div>
+                <div class="chat-input-wrapper">
+                    <input type="text" id="chatInput" placeholder="질문을 입력하세요..." class="chat-input" disabled>
+                    <button id="sendBtn" class="btn btn-send" disabled>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="22" y1="2" x2="11" y2="13"/>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast" id="toast">
+        <span id="toastMessage"></span>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.md
+.playwright-mcp/
+instance/
+firebase-debug.log
+uploads/
+transcripts/
+users.db
+*.log
+.env.example

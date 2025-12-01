@@ -232,6 +232,8 @@ body {
 }
 
 .upload-box {
+    display: block;
+    position: relative;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 12px;

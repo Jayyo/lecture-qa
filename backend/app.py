@@ -5,6 +5,8 @@ import requests
 import re
 import hashlib
 import threading
+import logging
+from datetime import datetime
 from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory, redirect, url_for, session
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -14,6 +16,22 @@ from authlib.integrations.flask_client import OAuth
 from openai import OpenAI
 from dotenv import load_dotenv
 from pathlib import Path
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Local Whisper support (optional)
+try:
+    import whisper
+    import torch
+    LOCAL_WHISPER_AVAILABLE = True
+except ImportError:
+    LOCAL_WHISPER_AVAILABLE = False
 
 # Load .env from project root (one level up from backend/)
 env_path = Path(__file__).parent.parent / '.env'
@@ -71,35 +89,157 @@ os.makedirs(TRANSCRIPT_FOLDER, exist_ok=True)
 # Maximum video duration in seconds (5 minutes)
 MAX_VIDEO_DURATION = 300
 
+# Whisper configuration
+# USE_LOCAL_WHISPER: Set to 'true' to use local Whisper model instead of OpenAI API
+# WHISPER_MODEL: tiny, base, small, medium, large (default: small)
+USE_LOCAL_WHISPER = os.getenv('USE_LOCAL_WHISPER', 'false').lower() == 'true'
+WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'small')
+
+# Load local Whisper model if enabled
+local_whisper_model = None
+if USE_LOCAL_WHISPER and LOCAL_WHISPER_AVAILABLE:
+    print(f"[Whisper] Loading local model: {WHISPER_MODEL}")
+    local_whisper_model = whisper.load_model(WHISPER_MODEL)
+    device = next(local_whisper_model.parameters()).device
+    print(f"[Whisper] Model loaded on device: {device}")
+elif USE_LOCAL_WHISPER and not LOCAL_WHISPER_AVAILABLE:
+    print("[Whisper] Warning: USE_LOCAL_WHISPER=true but whisper not installed. Falling back to OpenAI API.")
+    USE_LOCAL_WHISPER = False
+
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Store transcription status and content
 transcription_store = {}
 transcription_status = {}
 
+def get_request_info():
+    """Get request info for logging"""
+    return {
+        'ip': request.headers.get('X-Forwarded-For', request.remote_addr),
+        'user_agent': request.headers.get('User-Agent', 'Unknown')[:100],
+        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+
+def is_valid_youtube_video_url(url):
+    """
+    Check if URL is a valid YouTube video URL (not channel/playlist).
+    Returns (is_valid, error_message)
+    """
+    # Patterns for invalid URLs (channels, playlists, etc.)
+    invalid_patterns = [
+        r'youtube\.com/channel/',
+        r'youtube\.com/c/',
+        r'youtube\.com/user/',
+        r'youtube\.com/@',
+        r'youtube\.com/playlist',
+        r'youtube\.com/feed/',
+        r'youtube\.com/results',
+    ]
+
+    for pattern in invalid_patterns:
+        if re.search(pattern, url, re.IGNORECASE):
+            return False, '채널이나 재생목록이 아닌 개별 영상 URL을 입력해주세요.'
+
+    # Patterns for valid video URLs
+    valid_patterns = [
+        r'youtube\.com/watch\?v=[\w-]+',
+        r'youtu\.be/[\w-]+',
+        r'youtube\.com/shorts/[\w-]+',
+        r'youtube\.com/embed/[\w-]+',
+    ]
+
+    for pattern in valid_patterns:
+        if re.search(pattern, url, re.IGNORECASE):
+            return True, None
+
+    return False, '올바른 YouTube 영상 URL을 입력해주세요.'
+
 def get_video_hash(video_path_or_url):
     """Generate a hash for video identification"""
     return hashlib.md5(video_path_or_url.encode()).hexdigest()
 
-def transcribe_audio(video_path, video_id):
-    """Transcribe video audio using OpenAI Whisper"""
-    try:
-        transcription_status[video_id] = {'status': 'processing', 'progress': 30}
+def transcribe_with_local_whisper(audio_path, video_id):
+    """Transcribe using local Whisper model"""
+    global local_whisper_model
 
-        # Extract audio from video using ffmpeg
-        audio_path = os.path.join(UPLOAD_FOLDER, f"{video_id}.mp3")
+    transcription_status[video_id] = {'status': 'processing', 'progress': 50, 'message': 'Transcribing with local Whisper...'}
 
-        transcription_status[video_id] = {'status': 'processing', 'progress': 35}
+    result = local_whisper_model.transcribe(
+        audio_path,
+        language="ko",  # Korean
+        verbose=False
+    )
 
-        # Extract audio
+    transcription_status[video_id] = {'status': 'processing', 'progress': 90}
+
+    # Process segments
+    segments = []
+    if 'segments' in result:
+        for seg in result['segments']:
+            segments.append({
+                'start': seg['start'],
+                'end': seg['end'],
+                'text': seg['text'].strip()
+            })
+
+    return {
+        'full_text': result['text'].strip(),
+        'segments': segments
+    }
+
+# OpenAI Whisper API file size limit (25MB)
+OPENAI_FILE_SIZE_LIMIT = 25 * 1024 * 1024  # 25MB in bytes
+# Chunk duration in seconds (2 minutes for safe margin)
+CHUNK_DURATION_SECONDS = 120
+
+def split_audio_into_chunks(audio_path, video_id):
+    """Split large audio file into smaller chunks using ffmpeg"""
+    import glob
+
+    # Get audio duration
+    result = subprocess.run([
+        'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1', audio_path
+    ], capture_output=True, text=True)
+
+    total_duration = float(result.stdout.strip())
+
+    # Calculate number of chunks
+    num_chunks = int(total_duration / CHUNK_DURATION_SECONDS) + 1
+
+    chunk_paths = []
+    base_path = audio_path.rsplit('.', 1)[0]
+
+    for i in range(num_chunks):
+        start_time = i * CHUNK_DURATION_SECONDS
+        chunk_path = f"{base_path}_chunk{i:03d}.mp3"
+
+        # Extract chunk with ffmpeg
         subprocess.run([
-            'ffmpeg', '-i', video_path, '-vn', '-acodec', 'libmp3lame',
-            '-q:a', '4', '-y', audio_path
-        ], check=True, capture_output=True)
+            'ffmpeg', '-i', audio_path,
+            '-ss', str(start_time),
+            '-t', str(CHUNK_DURATION_SECONDS),
+            '-acodec', 'libmp3lame', '-q:a', '4',
+            '-y', chunk_path
+        ], capture_output=True, check=True)
 
-        transcription_status[video_id] = {'status': 'processing', 'progress': 50}
+        chunk_paths.append({
+            'path': chunk_path,
+            'start_offset': start_time
+        })
 
-        # Transcribe using OpenAI Whisper
+    return chunk_paths
+
+def transcribe_with_openai_api(audio_path, video_id):
+    """Transcribe using OpenAI Whisper API with chunking for large files"""
+
+    # Check file size
+    file_size = os.path.getsize(audio_path)
+
+    if file_size <= OPENAI_FILE_SIZE_LIMIT:
+        # Small file - transcribe directly
+        transcription_status[video_id] = {'status': 'processing', 'progress': 50, 'message': 'Transcribing with OpenAI API...'}
+
         with open(audio_path, 'rb') as audio_file:
             transcript = client.audio.transcriptions.create(
                 model="whisper-1",
@@ -110,7 +250,7 @@ def transcribe_audio(video_path, video_id):
 
         transcription_status[video_id] = {'status': 'processing', 'progress': 90}
 
-        # Process segments with timestamps
+        # Process segments
         segments = []
         if hasattr(transcript, 'segments') and transcript.segments:
             for seg in transcript.segments:
@@ -120,12 +260,106 @@ def transcribe_audio(video_path, video_id):
                     'text': seg.text
                 })
 
-        # Save transcript
-        transcript_data = {
+        return {
             'full_text': transcript.text,
             'segments': segments
         }
 
+    # Large file - split into chunks and transcribe each
+    print(f"[Whisper] Large file detected ({file_size / 1024 / 1024:.1f}MB), splitting into chunks...")
+    transcription_status[video_id] = {'status': 'processing', 'progress': 40, 'message': 'Splitting audio into chunks...'}
+
+    try:
+        chunks = split_audio_into_chunks(audio_path, video_id)
+        all_segments = []
+        all_text = []
+
+        for i, chunk_info in enumerate(chunks):
+            chunk_path = chunk_info['path']
+            start_offset = chunk_info['start_offset']
+
+            progress = 45 + int((i / len(chunks)) * 40)
+            transcription_status[video_id] = {
+                'status': 'processing',
+                'progress': progress,
+                'message': f'Transcribing chunk {i+1}/{len(chunks)}...'
+            }
+
+            print(f"[Whisper] Transcribing chunk {i+1}/{len(chunks)}...")
+
+            with open(chunk_path, 'rb') as audio_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"]
+                )
+
+            # Add text
+            all_text.append(transcript.text)
+
+            # Add segments with adjusted timestamps
+            if hasattr(transcript, 'segments') and transcript.segments:
+                for seg in transcript.segments:
+                    all_segments.append({
+                        'start': seg.start + start_offset,
+                        'end': seg.end + start_offset,
+                        'text': seg.text
+                    })
+
+            # Cleanup chunk file
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+
+        transcription_status[video_id] = {'status': 'processing', 'progress': 90}
+
+        return {
+            'full_text': ' '.join(all_text),
+            'segments': all_segments
+        }
+
+    except Exception as e:
+        # Cleanup any remaining chunk files
+        import glob
+        base_path = audio_path.rsplit('.', 1)[0]
+        for chunk_file in glob.glob(f"{base_path}_chunk*.mp3"):
+            try:
+                os.remove(chunk_file)
+            except:
+                pass
+        raise e
+
+def transcribe_audio(video_path, video_id):
+    """Transcribe video audio using local Whisper or OpenAI API"""
+    try:
+        logger.info(f"[TRANSCRIBE] Starting | video_id: {video_id} | video_path: {video_path}")
+        transcription_status[video_id] = {'status': 'processing', 'progress': 30}
+
+        # Extract audio from video using ffmpeg
+        audio_path = os.path.join(UPLOAD_FOLDER, f"{video_id}.mp3")
+
+        transcription_status[video_id] = {'status': 'processing', 'progress': 35, 'message': 'Extracting audio...'}
+        logger.info(f"[TRANSCRIBE] Extracting audio | video_id: {video_id}")
+
+        # Extract audio
+        subprocess.run([
+            'ffmpeg', '-i', video_path, '-vn', '-acodec', 'libmp3lame',
+            '-q:a', '4', '-y', audio_path
+        ], check=True, capture_output=True)
+
+        # Get audio file size for logging
+        audio_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+        logger.info(f"[TRANSCRIBE] Audio extracted | video_id: {video_id} | size: {audio_size/1024/1024:.2f}MB")
+
+        # Choose transcription method
+        if USE_LOCAL_WHISPER and local_whisper_model is not None:
+            logger.info(f"[TRANSCRIBE] Using local Whisper | video_id: {video_id}")
+            transcript_data = transcribe_with_local_whisper(audio_path, video_id)
+        else:
+            logger.info(f"[TRANSCRIBE] Using OpenAI API | video_id: {video_id}")
+            transcript_data = transcribe_with_openai_api(audio_path, video_id)
+
+        # Save transcript
         transcript_path = os.path.join(TRANSCRIPT_FOLDER, f"{video_id}.json")
         with open(transcript_path, 'w', encoding='utf-8') as f:
             json.dump(transcript_data, f, ensure_ascii=False, indent=2)
@@ -133,13 +367,17 @@ def transcribe_audio(video_path, video_id):
         transcription_store[video_id] = transcript_data
         transcription_status[video_id] = {'status': 'completed', 'progress': 100}
 
+        logger.info(f"[TRANSCRIBE] Completed | video_id: {video_id} | segments: {len(transcript_data.get('segments', []))}")
+
         # Cleanup audio file
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
     except Exception as e:
         transcription_status[video_id] = {'status': 'error', 'error': str(e)}
-        print(f"Transcription error: {e}")
+        logger.error(f"[TRANSCRIBE] Error | video_id: {video_id} | error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 def get_video_duration(url, yt_dlp_path='yt-dlp'):
     """Get video duration in seconds using yt-dlp"""
@@ -315,22 +553,38 @@ def serve_uploads(filename):
 @app.route('/api/upload', methods=['POST'])
 def upload_video():
     """Handle video file upload"""
+    req_info = get_request_info()
+
     if 'video' not in request.files:
+        logger.warning(f"[UPLOAD] No video file | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
         return jsonify({'error': 'No video file provided'}), 400
 
     file = request.files['video']
     if file.filename == '':
+        logger.warning(f"[UPLOAD] Empty filename | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
         return jsonify({'error': 'No selected file'}), 400
+
+    # Get file size
+    file.seek(0, 2)  # Seek to end
+    file_size = file.tell()
+    file.seek(0)  # Seek back to start
 
     video_id = get_video_hash(file.filename + str(os.urandom(8)))
     filename = f"{video_id}.mp4"
     filepath = os.path.join(UPLOAD_FOLDER, filename)
+
+    logger.info(f"[UPLOAD] Started | video_id: {video_id} | filename: {file.filename} | size: {file_size/1024/1024:.2f}MB | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
+
     file.save(filepath)
+
+    logger.info(f"[UPLOAD] File saved | video_id: {video_id} | path: {filepath}")
 
     # Start transcription in background
     transcription_status[video_id] = {'status': 'processing', 'progress': 10}
     thread = threading.Thread(target=transcribe_audio, args=(filepath, video_id))
     thread.start()
+
+    logger.info(f"[UPLOAD] Transcription started | video_id: {video_id}")
 
     return jsonify({
         'video_id': video_id,
@@ -341,17 +595,28 @@ def upload_video():
 @app.route('/api/youtube', methods=['POST'])
 def process_youtube():
     """Process YouTube URL"""
+    req_info = get_request_info()
     data = request.json
     url = data.get('url')
 
     if not url:
+        logger.warning(f"[YOUTUBE] No URL provided | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
         return jsonify({'error': 'No URL provided'}), 400
+
+    logger.info(f"[YOUTUBE] Request | URL: {url} | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
+
+    # Validate YouTube URL (reject channels, playlists, etc.)
+    is_valid, error_msg = is_valid_youtube_video_url(url)
+    if not is_valid:
+        logger.warning(f"[YOUTUBE] Invalid URL rejected | URL: {url} | Reason: {error_msg} | IP: {req_info['ip']}")
+        return jsonify({'error': 'invalid_url', 'message': error_msg}), 400
 
     video_id = get_video_hash(url)
 
     # Check if already transcribed
     transcript_path = os.path.join(TRANSCRIPT_FOLDER, f"{video_id}.json")
     if os.path.exists(transcript_path):
+        logger.info(f"[YOUTUBE] Cache hit | video_id: {video_id} | URL: {url}")
         with open(transcript_path, 'r', encoding='utf-8') as f:
             transcription_store[video_id] = json.load(f)
         transcription_status[video_id] = {'status': 'completed', 'progress': 100}
@@ -368,11 +633,14 @@ def process_youtube():
     # Check video duration before downloading
     duration = get_video_duration(url)
     if duration and duration > MAX_VIDEO_DURATION:
+        logger.warning(f"[YOUTUBE] Duration exceeded | URL: {url} | duration: {duration}s | IP: {req_info['ip']}")
         return jsonify({
             'error': 'duration_exceeded',
             'message': '5분 이하의 동영상만 불러올 수 있습니다.',
             'duration': duration
         }), 400
+
+    logger.info(f"[YOUTUBE] Starting download | video_id: {video_id} | URL: {url} | duration: {duration}s")
 
     transcription_status[video_id] = {'status': 'downloading', 'progress': 0}
 
@@ -380,8 +648,10 @@ def process_youtube():
     def process():
         video_path = download_youtube_video(url, video_id)
         if video_path:
+            logger.info(f"[YOUTUBE] Download complete | video_id: {video_id}")
             transcribe_audio(video_path, video_id)
         else:
+            logger.error(f"[YOUTUBE] Download failed | video_id: {video_id} | URL: {url}")
             transcription_status[video_id] = {'status': 'error', 'error': 'Failed to download video'}
 
     thread = threading.Thread(target=process)

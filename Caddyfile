@@ -1,0 +1,3 @@
+lecture-qa.example.com {
+    reverse_proxy lecture-qa:5000
+}

@@ -25,7 +25,7 @@
 
         <!-- Upload Section -->
         <section class="upload-section" id="uploadSection">
-            <div class="upload-box" id="uploadBox">
+            <label class="upload-box" id="uploadBox" for="videoInput">
                 <div class="upload-content">
                     <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -35,8 +35,8 @@
                     <p class="upload-text">클릭하여 동영상 업로드</p>
                     <p class="upload-hint">또는 YouTube URL 입력</p>
                 </div>
-                <input type="file" id="videoInput" accept="video/*" hidden>
-            </div>
+                <input type="file" id="videoInput" accept="video/*" style="position: absolute; left: -9999px; opacity: 0;">
+            </label>
 
             <!-- YouTube URL Input -->
             <div class="url-input-section">

@@ -1,395 +1,486 @@
-// State
-let currentVideoId = null;
-let currentAnswer = '';
-let currentQuestion = '';
-let isTranscribing = false;
-let statusCheckInterval = null;
-let questionTime = 0;
-let isAsking = false;
-let history = [];
+// Lecture Q&A front end: pick a video, follow the transcription job, ask questions.
 
-// DOM Elements
-const uploadBox = document.getElementById('uploadBox');
-const videoInput = document.getElementById('videoInput');
-const youtubeUrl = document.getElementById('youtubeUrl');
-const loadYoutube = document.getElementById('loadYoutube');
-const uploadSection = document.getElementById('uploadSection');
-const videoSection = document.getElementById('videoSection');
-const videoPlayer = document.getElementById('videoPlayer');
-const videoContainer = document.getElementById('videoContainer');
-const answerOverlay = document.getElementById('answerOverlay');
-const answerText = document.getElementById('answerText');
-const transcriptionOverlay = document.getElementById('transcriptionOverlay');
-const transcriptionStatus = document.getElementById('transcriptionStatus');
-const progressFill = document.getElementById('progressFill');
-const progressText = document.getElementById('progressText');
-const chatInput = document.getElementById('chatInput');
-const sendBtn = document.getElementById('sendBtn');
-const chatMessages = document.getElementById('chatMessages');
-const newVideoBtn = document.getElementById('newVideoBtn');
-const closeAnswer = document.getElementById('closeAnswer');
-const thumbsUp = document.getElementById('thumbsUp');
-const thumbsDown = document.getElementById('thumbsDown');
-const feedbackButtons = document.getElementById('feedbackButtons');
+const $ = (id) => document.getElementById(id);
+
+const startSection = $('startSection');
+const workspace = $('workspace');
+const dropZone = $('dropZone');
+const videoInput = $('videoInput');
+const youtubeForm = $('youtubeForm');
+const youtubeUrl = $('youtubeUrl');
+const loadYoutubeBtn = $('loadYoutube');
+const videoTitle = $('videoTitle');
+const newVideoBtn = $('newVideoBtn');
+const videoPlayer = $('videoPlayer');
+const ytMount = $('ytMount');
+const jobStatus = $('jobStatus');
+const jobStatusText = $('jobStatusText');
+const jobStatusPercent = $('jobStatusPercent');
+const progressFill = $('progressFill');
+const transcriptList = $('transcriptList');
+const transcriptMeta = $('transcriptMeta');
+const chatMessages = $('chatMessages');
+const chatForm = $('chatForm');
+const chatInput = $('chatInput');
+const sendBtn = $('sendBtn');
+
 const welcomeMessage = chatMessages.querySelector('.welcome-message').cloneNode(true);
+const emptyTranscript = transcriptList.querySelector('.transcript-empty').cloneNode(true);
 
-// Show the server's limits under the URL box
+let config = { max_minutes: 20, max_upload_mb: 300 };
+let job = null;            // { id, kind: 'upload' | 'youtube', ... }
+let segments = [];
+let history = [];          // last questions and answers, sent along for follow-ups
+let pollTimer = null;
+let askController = null;
+let uploadRequest = null;
+let activeIndex = -1;
+
 fetch('/api/config')
-    .then(response => response.json())
-    .then(config => {
-        document.getElementById('limitHint').textContent =
-            `* ${config.max_minutes}분 이하, ${config.max_upload_mb}MB 이하의 MP4/WebM 영상을 지원합니다`;
+    .then((response) => response.json())
+    .then((data) => {
+        config = data;
+        $('limitHint').textContent = `MP4 · WebM, ${data.max_minutes}분 · ${data.max_upload_mb}MB까지`;
     })
     .catch(() => {});
 
-// Toast notification
-function showToast(message, type = 'default') {
-    const toast = document.getElementById('toast');
-    const toastMessage = document.getElementById('toastMessage');
-    toastMessage.textContent = message;
-    toast.className = 'toast show';
-    if (type) toast.classList.add(type);
+// ---------------------------------------------------------------- helpers
 
-    setTimeout(() => {
-        toast.className = 'toast';
-    }, 3000);
+let toastTimer = null;
+function showToast(message, type = '') {
+    const toast = $('toast');
+    toast.textContent = message;
+    toast.className = `toast show ${type}`;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.className = 'toast'; }, 3500);
 }
 
-// Upload handlers - using label[for] natively triggers file input
-// No click handler needed for uploadBox since it's now a <label for="videoInput">
+function formatTime(seconds) {
+    const total = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(total / 3600);
+    const m = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+    const s = String(total % 60).padStart(2, '0');
+    return h ? `${h}:${m}:${s}` : `${m}:${s}`;
+}
 
-videoInput.addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+async function postJSON(url, body, options = {}) {
+    return fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        ...options,
+    });
+}
 
-    const formData = new FormData();
-    formData.append('video', file);
+// ---------------------------------------------------------------- player
+// One interface over the <video> element (uploads) and the YouTube iframe.
 
-    // Show upload section with progress
-    uploadSection.hidden = true;
-    videoSection.hidden = false;
-    transcriptionOverlay.classList.add('active');
-    transcriptionStatus.textContent = '영상을 업로드하고 있습니다...';
-    progressFill.style.width = '0%';
-    progressText.textContent = '0%';
+const player = {
+    kind: null,
+    yt: null,
 
-    try {
-        const response = await fetch('/api/upload', {
-            method: 'POST',
-            body: formData
-        });
-
-        const data = await response.json();
-        if (response.ok) {
-            currentVideoId = data.video_id;
-            videoPlayer.src = data.video_url;
-            videoPlayer.load();
-            startStatusCheck();
-        } else {
-            showToast(data.message || data.error || '업로드 실패', 'error');
-            resetToUpload();
+    time() {
+        if (this.kind === 'youtube') {
+            return (this.yt && this.yt.getCurrentTime && this.yt.getCurrentTime()) || 0;
         }
-    } catch (error) {
-        showToast('업로드 중 오류가 발생했습니다', 'error');
-        console.error(error);
-        resetToUpload();
+        return videoPlayer.currentTime || 0;
+    },
+    play() {
+        if (this.kind === 'youtube') {
+            if (this.yt && this.yt.playVideo) this.yt.playVideo();
+        } else {
+            videoPlayer.play().catch(() => {});
+        }
+    },
+    pause() {
+        if (this.kind === 'youtube') {
+            if (this.yt && this.yt.pauseVideo) this.yt.pauseVideo();
+        } else {
+            videoPlayer.pause();
+        }
+    },
+    seek(seconds) {
+        if (this.kind === 'youtube') {
+            if (this.yt && this.yt.seekTo) this.yt.seekTo(seconds, true);
+        } else {
+            videoPlayer.currentTime = seconds;
+        }
+    },
+    destroy() {
+        if (this.yt) {
+            try { this.yt.destroy(); } catch (e) { /* already gone */ }
+            this.yt = null;
+        }
+        ytMount.replaceChildren();
+        ytMount.hidden = true;
+        videoPlayer.pause();
+        videoPlayer.removeAttribute('src');
+        videoPlayer.load();
+        videoPlayer.hidden = true;
+        this.kind = null;
+    },
+};
+
+let youtubeApi = null;
+function loadYouTubeApi() {
+    if (!youtubeApi) {
+        youtubeApi = new Promise((resolve, reject) => {
+            if (window.YT && window.YT.Player) {
+                resolve(window.YT);
+                return;
+            }
+            window.onYouTubeIframeAPIReady = () => resolve(window.YT);
+            const script = document.createElement('script');
+            script.src = 'https://www.youtube.com/iframe_api';
+            script.onerror = () => {
+                youtubeApi = null;
+                reject(new Error('YouTube API failed to load'));
+            };
+            document.head.appendChild(script);
+        });
+    }
+    return youtubeApi;
+}
+
+async function mountYouTube(youtubeId) {
+    const YT = await loadYouTubeApi();
+    const target = document.createElement('div');
+    ytMount.replaceChildren(target);
+    ytMount.hidden = false;
+    player.kind = 'youtube';
+    player.yt = new YT.Player(target, {
+        host: 'https://www.youtube-nocookie.com',
+        videoId: youtubeId,
+        playerVars: { rel: 0, playsinline: 1 },
+        events: {
+            onError: (event) => {
+                if (event.data === 101 || event.data === 150) {
+                    showToast('영상 소유자가 다른 사이트에서의 재생을 막아 두었어요. 영상 파일을 직접 올려 주세요.', 'error');
+                }
+            },
+        },
+    });
+}
+
+function mountUpload(url) {
+    player.kind = 'html5';
+    videoPlayer.src = url;
+    videoPlayer.hidden = false;
+}
+
+videoPlayer.addEventListener('error', () => {
+    if (videoPlayer.getAttribute('src')) {
+        showToast('브라우저가 이 영상을 재생하지 못해요. H.264 MP4로 변환해서 올려 주세요.', 'error');
     }
 });
 
-// YouTube URL handler
-loadYoutube.addEventListener('click', async () => {
-    const url = youtubeUrl.value.trim();
-    if (!url) {
-        showToast('YouTube URL을 입력해주세요', 'error');
+// ---------------------------------------------------------------- start screen
+
+videoInput.addEventListener('change', () => {
+    if (videoInput.files[0]) uploadFile(videoInput.files[0]);
+});
+
+['dragenter', 'dragover'].forEach((type) => dropZone.addEventListener(type, (event) => {
+    event.preventDefault();
+    dropZone.classList.add('dragging');
+}));
+['dragleave', 'drop'].forEach((type) => dropZone.addEventListener(type, (event) => {
+    event.preventDefault();
+    dropZone.classList.remove('dragging');
+}));
+dropZone.addEventListener('drop', (event) => {
+    const file = event.dataTransfer.files[0];
+    if (file) uploadFile(file);
+});
+
+function uploadFile(file) {
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (!['mp4', 'm4v', 'mov', 'webm'].includes(ext)) {
+        showToast('MP4 또는 WebM 영상만 올릴 수 있어요.', 'error');
+        return;
+    }
+    if (file.size > config.max_upload_mb * 1024 * 1024) {
+        showToast(`${config.max_upload_mb}MB 이하의 파일만 올릴 수 있어요.`, 'error');
         return;
     }
 
-    // Show loading state immediately
-    uploadSection.hidden = true;
-    videoSection.hidden = false;
-    transcriptionOverlay.classList.add('active');
-    transcriptionStatus.textContent = '영상을 다운로드하고 있습니다...';
-    progressFill.style.width = '0%';
-    progressText.textContent = '0%';
+    openWorkspace(file.name);
+    setStatus('영상을 올리는 중', 0);
 
-    try {
-        const response = await fetch('/api/youtube', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url })
-        });
-
-        const data = await response.json();
-        if (response.ok) {
-            currentVideoId = data.video_id;
-            videoPlayer.src = data.video_url;
-            videoPlayer.load();
-
-            if (data.cached) {
-                transcriptionOverlay.classList.remove('active');
-                videoPlayer.setAttribute('controls', '');
-                enableChat();
-                showToast('캐시된 영상을 불러왔습니다', 'success');
-            } else {
-                startStatusCheck();
-            }
-        } else {
-            showToast(data.message || data.error || '불러오기 실패', 'error');
-            resetToUpload();
+    const form = new FormData();
+    form.append('video', file);
+    const xhr = new XMLHttpRequest();
+    uploadRequest = xhr;
+    xhr.open('POST', '/api/upload');
+    xhr.responseType = 'json';
+    xhr.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable) setStatus('영상을 올리는 중', Math.round((event.loaded / event.total) * 100));
+    });
+    xhr.addEventListener('load', () => {
+        uploadRequest = null;
+        const data = xhr.response || {};
+        if (xhr.status !== 200) {
+            resetToStart();
+            showToast(data.message || '업로드에 실패했어요.', 'error');
+            return;
         }
+        startJob({ id: data.video_id, kind: 'upload', mediaUrl: data.video_url });
+    });
+    xhr.addEventListener('error', () => {
+        uploadRequest = null;
+        resetToStart();
+        showToast('업로드 중에 연결이 끊겼어요.', 'error');
+    });
+    xhr.send(form);
+}
+
+youtubeForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const url = youtubeUrl.value.trim();
+    if (!url) {
+        showToast('YouTube 영상 주소를 입력해 주세요.', 'error');
+        return;
+    }
+    loadYoutubeBtn.disabled = true;
+    try {
+        const response = await postJSON('/api/youtube', { url });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            showToast(data.message || '영상을 불러오지 못했어요.', 'error');
+            return;
+        }
+        openWorkspace(data.title || 'YouTube 영상');
+        startJob({ id: data.video_id, kind: 'youtube', youtubeId: data.youtube_id, ready: data.cached });
     } catch (error) {
-        showToast('영상을 불러오는 중 오류가 발생했습니다', 'error');
-        console.error(error);
-        resetToUpload();
+        showToast('영상을 불러오지 못했어요.', 'error');
+    } finally {
+        loadYoutubeBtn.disabled = false;
     }
 });
 
-// Status check for transcription
-function startStatusCheck() {
-    if (statusCheckInterval) {
-        clearInterval(statusCheckInterval);
+// ---------------------------------------------------------------- job
+
+function openWorkspace(title) {
+    startSection.hidden = true;
+    workspace.hidden = false;
+    newVideoBtn.hidden = false;
+    videoTitle.textContent = title;
+}
+
+function setStatus(text, percent) {
+    jobStatus.hidden = false;
+    jobStatus.classList.remove('error');
+    jobStatusText.textContent = text;
+    jobStatusPercent.textContent = `${percent}%`;
+    progressFill.style.width = `${percent}%`;
+}
+
+function failJob(message) {
+    clearTimeout(pollTimer);
+    jobStatus.hidden = false;
+    jobStatus.classList.add('error');
+    jobStatusText.textContent = message;
+    transcriptList.replaceChildren();
+    showToast(message, 'error');
+}
+
+function startJob(next) {
+    job = next;
+    if (job.kind === 'upload') {
+        mountUpload(job.mediaUrl);
+    } else {
+        mountYouTube(job.youtubeId).catch(() => showToast('YouTube 플레이어를 불러오지 못했어요.', 'error'));
     }
+    if (job.ready) {
+        loadTranscript();
+    } else {
+        setStatus('작업을 준비하는 중', 0);
+        pollStatus(job.id);
+    }
+}
 
-    statusCheckInterval = setInterval(async () => {
+function statusText(data) {
+    if (data.status === 'downloading') return 'YouTube에서 오디오를 받는 중';
+    if ((data.progress || 0) < 30) return '오디오를 추출하는 중';
+    return '음성을 자막으로 바꾸는 중';
+}
+
+function pollStatus(id) {
+    let failures = 0;
+    const tick = async () => {
+        if (!job || job.id !== id) return;
+        let response = null;
+        let data = null;
         try {
-            const response = await fetch(`/api/status/${currentVideoId}`);
-            const data = await response.json();
+            response = await fetch(`/api/status/${encodeURIComponent(id)}`);
+            data = await response.json();
+        } catch (error) {
+            data = null;
+        }
+        if (!job || job.id !== id) return;
 
-            if (response.status === 404) {
-                clearInterval(statusCheckInterval);
-                statusCheckInterval = null;
-                showToast('작업을 찾을 수 없어요. 영상을 다시 올려 주세요.', 'error');
-                resetToUpload();
+        if (response && response.status === 404) {
+            failJob('작업을 찾을 수 없어요. 영상을 다시 열어 주세요.');
+            return;
+        }
+        if (!data) {
+            if (++failures >= 10) {
+                failJob('서버에 연결할 수 없어요.');
                 return;
             }
-
-            updateTranscriptionProgress(data);
-
+        } else {
+            failures = 0;
+            if (data.title) videoTitle.textContent = data.title;
             if (data.status === 'completed') {
-                clearInterval(statusCheckInterval);
-                statusCheckInterval = null;
-                transcriptionComplete();
-            } else if (data.status === 'error') {
-                clearInterval(statusCheckInterval);
-                statusCheckInterval = null;
-                showToast(`오류: ${data.error}`, 'error');
-                resetToUpload();
+                loadTranscript();
+                return;
             }
-        } catch (error) {
-            console.error('Status check error:', error);
+            if (data.status === 'error') {
+                failJob(data.error || '영상을 처리하지 못했어요.');
+                return;
+            }
+            setStatus(statusText(data), data.progress || 0);
         }
-    }, 1000);
+        pollTimer = setTimeout(tick, 1000);
+    };
+    tick();
 }
 
-function updateTranscriptionProgress(data) {
-    const progress = data.progress || 0;
-
-    // More detailed status messages based on progress
-    let statusMessage;
-    if (data.status === 'downloading') {
-        statusMessage = `영상을 다운로드하고 있습니다... (${progress}%)`;
-    } else if (data.status === 'processing') {
-        if (progress < 40) {
-            statusMessage = '오디오를 추출하고 있습니다...';
-        } else if (progress < 80) {
-            statusMessage = '음성을 분석하고 있습니다...';
-        } else {
-            statusMessage = '분석 결과를 저장하고 있습니다...';
-        }
-    } else if (data.status === 'completed') {
-        statusMessage = '분석이 완료되었습니다!';
-    } else {
-        statusMessage = '처리 중...';
+async function loadTranscript() {
+    const id = job.id;
+    let data = null;
+    try {
+        const response = await fetch(`/api/transcript/${encodeURIComponent(id)}`);
+        if (response.ok) data = await response.json();
+    } catch (error) {
+        data = null;
+    }
+    if (!job || job.id !== id) return;
+    if (!data) {
+        failJob('자막을 불러오지 못했어요.');
+        return;
     }
 
-    transcriptionStatus.textContent = statusMessage;
-    progressFill.style.width = `${progress}%`;
-    progressText.textContent = `${progress}%`;
-}
-
-function transcriptionComplete() {
-    isTranscribing = false;
-    transcriptionOverlay.classList.remove('active');
-
-    // Reload video to ensure it's playable
-    const currentSrc = videoPlayer.src;
-    videoPlayer.src = '';
-    videoPlayer.load();
-    setTimeout(() => {
-        videoPlayer.src = currentSrc;
-        videoPlayer.load();
-        videoPlayer.setAttribute('controls', '');
-    }, 100);
-
-    enableChat();
-    showToast('분석 완료! 이제 영상을 재생하고 질문할 수 있습니다', 'success');
-}
-
-function enableChat() {
+    segments = data.segments || [];
+    if (data.title) videoTitle.textContent = data.title;
+    renderTranscript(data);
+    jobStatus.hidden = true;
     chatInput.disabled = false;
     sendBtn.disabled = false;
-    chatInput.placeholder = '질문을 입력하세요...';
+    chatInput.placeholder = '질문을 입력하세요';
 }
 
-function disableChat() {
-    chatInput.disabled = true;
-    sendBtn.disabled = true;
-    chatInput.placeholder = '분석 중입니다...';
-}
+// ---------------------------------------------------------------- transcript
 
-// New video handler
-newVideoBtn.addEventListener('click', () => {
-    resetToUpload();
-});
+function renderTranscript(data) {
+    transcriptMeta.textContent = [`${segments.length}개 구간`, data.model].filter(Boolean).join(' · ');
+    activeIndex = -1;
+    const items = segments.map((segment, index) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'segment';
+        button.dataset.index = index;
 
-function resetToUpload() {
-    // Clear state
-    currentVideoId = null;
-    currentAnswer = '';
-    currentQuestion = '';
-    history = [];
-    isTranscribing = false;
-
-    if (statusCheckInterval) {
-        clearInterval(statusCheckInterval);
-        statusCheckInterval = null;
-    }
-
-    // Reset UI
-    videoSection.hidden = true;
-    uploadSection.hidden = false;
-    videoPlayer.src = '';
-    videoPlayer.removeAttribute('controls');
-    youtubeUrl.value = '';
-    videoInput.value = '';
-    chatMessages.replaceChildren(welcomeMessage.cloneNode(true));
-    answerOverlay.classList.remove('active');
-    transcriptionOverlay.classList.remove('active');
-    disableChat();
-}
-
-// Chat handlers
-chatInput.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendQuestion();
-    }
-});
-
-sendBtn.addEventListener('click', sendQuestion);
-
-async function sendQuestion() {
-    const question = chatInput.value.trim();
-    if (!question || !currentVideoId || isAsking) return;
-    isAsking = true;
-    sendBtn.disabled = true;
-
-    // Pause video
-    videoPlayer.pause();
-
-    // Remember what was asked and when, for the feedback mail
-    currentQuestion = question;
-    questionTime = videoPlayer.currentTime;
-
-    addChatMessage(question, 'user');
-    chatInput.value = '';
-
-    // Show answer overlay
-    answerOverlay.classList.add('active');
-    answerText.textContent = '';
-    feedbackButtons.style.display = 'none';
-    currentAnswer = '';
-
-    try {
-        const response = await fetch('/api/ask', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                video_id: currentVideoId,
-                question: question,
-                current_time: questionTime,
-                history: history.slice(-3)
-            })
+        const time = document.createElement('span');
+        time.className = 'segment-time';
+        time.textContent = formatTime(segment.start);
+        const text = document.createElement('span');
+        text.textContent = segment.text;
+        button.append(time, text);
+        button.addEventListener('click', () => {
+            player.seek(segment.start);
+            player.play();
         });
 
-        if (!response.ok) {
-            const data = await response.json().catch(() => ({}));
-            throw new Error(data.message || data.error || `HTTP ${response.status}`);
-        }
-
-        await readEventStream(response, (data) => {
-            if (data.delta) {
-                currentAnswer += data.delta;
-                renderAnswer(answerText, currentAnswer);
-            }
-            if (data.error) {
-                answerText.textContent = data.error;
-            }
-        });
-        if (currentAnswer) {
-            history.push({ question, answer: currentAnswer });
-        }
-    } catch (error) {
-        answerText.textContent = '답변을 가져오는 중 오류가 발생했습니다.';
-        console.error(error);
-    } finally {
-        feedbackButtons.style.display = 'flex';
-        isAsking = false;
-        sendBtn.disabled = false;
-    }
+        const item = document.createElement('li');
+        item.appendChild(button);
+        return item;
+    });
+    transcriptList.replaceChildren(...items);
 }
 
-// Server-sent events arrive in arbitrary network chunks, so buffer until a blank line
-async function readEventStream(response, onEvent) {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+// Highlight the segment that is playing and keep it in view
+setInterval(() => {
+    if (!segments.length || workspace.hidden) return;
+    const now = player.time();
+    let index = -1;
+    for (let i = 0; i < segments.length && segments[i].start <= now + 0.1; i++) index = i;
+    if (index === activeIndex) return;
 
-    while (true) {
-        const { done, value } = await reader.read();
-        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-
-        let boundary;
-        while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-            const block = buffer.slice(0, boundary);
-            buffer = buffer.slice(boundary + 2);
-            const payload = block.split('\n')
-                .filter(line => line.startsWith('data: '))
-                .map(line => line.slice(6))
-                .join('\n');
-            if (payload) {
-                try {
-                    onEvent(JSON.parse(payload));
-                } catch (e) {
-                    console.warn('Bad event', payload);
-                }
-            }
-        }
-        if (done) break;
+    const previous = transcriptList.querySelector('.segment.active');
+    if (previous) previous.classList.remove('active');
+    activeIndex = index;
+    const current = transcriptList.querySelector(`.segment[data-index="${index}"]`);
+    if (!current) return;
+    current.classList.add('active');
+    const top = current.offsetTop;
+    const bottom = top + current.offsetHeight;
+    if (top < transcriptList.scrollTop || bottom > transcriptList.scrollTop + transcriptList.clientHeight) {
+        transcriptList.scrollTo({ top: top - 8, behavior: 'smooth' });
     }
+}, 300);
+
+// ---------------------------------------------------------------- chat
+
+chatForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    ask();
+});
+
+// Enter that only finishes a Korean IME composition must not submit
+chatInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.isComposing || event.keyCode === 229)) event.preventDefault();
+});
+
+function addMessage(sender, text, at) {
+    const welcome = chatMessages.querySelector('.welcome-message');
+    if (welcome) welcome.remove();
+
+    const message = document.createElement('div');
+    message.className = `chat-message ${sender}`;
+    const label = document.createElement('div');
+    label.className = 'message-label';
+    label.textContent = sender === 'user' ? `나 · ${formatTime(at)}` : 'AI';
+    const bubble = document.createElement('div');
+    bubble.className = 'message-bubble';
+    bubble.textContent = text;
+    message.append(label, bubble);
+    chatMessages.appendChild(message);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return bubble;
 }
 
-// Answers cite moments like [03:12]; turn those into buttons that jump there.
+// Answers cite moments like [03:12]; those become buttons that jump there.
 const TIMESTAMP_RE = /\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:\s*[-–~]\s*(?:\d{1,2}:)?\d{1,2}:\d{2})?\]/g;
 
+function segmentStartFor(seconds) {
+    if (!segments.length) return null;
+    const last = segments[segments.length - 1];
+    if (seconds > Math.max(last.end || 0, last.start) + 1) return null;
+    let start = segments[0].start;
+    for (const segment of segments) {
+        if (segment.start > seconds + 0.5) break;
+        start = segment.start;
+    }
+    return start;
+}
+
 function renderAnswer(element, text) {
-    const duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : Infinity;
     const nodes = [];
     let last = 0;
     for (const match of text.matchAll(TIMESTAMP_RE)) {
-        const seconds = (Number(match[1] || 0) * 3600) + Number(match[2]) * 60 + Number(match[3]);
-        if (seconds > duration) continue;
+        const cited = Number(match[1] || 0) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+        const target = segmentStartFor(cited);
+        if (target === null) continue;
         nodes.push(document.createTextNode(text.slice(last, match.index)));
         const chip = document.createElement('button');
         chip.type = 'button';
         chip.className = 'timestamp-chip';
-        chip.textContent = match[0].slice(1, -1);
-        chip.title = '이 부분으로 이동';
+        chip.textContent = formatTime(cited);
+        chip.title = '이 장면으로 이동';
         chip.addEventListener('click', () => {
-            videoPlayer.currentTime = seconds;
-            answerOverlay.classList.remove('active');
-            videoPlayer.play();
+            player.seek(target);
+            player.play();
         });
         nodes.push(chip);
         last = match.index + match[0].length;
@@ -398,107 +489,180 @@ function renderAnswer(element, text) {
     element.replaceChildren(...nodes);
 }
 
-function addChatMessage(text, sender) {
-    // Remove welcome message if exists
-    const welcome = chatMessages.querySelector('.welcome-message');
-    if (welcome) welcome.remove();
+function addAnswerActions(bubble, item) {
+    const actions = document.createElement('div');
+    actions.className = 'message-actions';
 
-    const messageDiv = document.createElement('div');
-    messageDiv.className = `chat-message ${sender}`;
+    const resume = document.createElement('button');
+    resume.type = 'button';
+    resume.className = 'link-btn';
+    resume.textContent = '이어서 보기';
+    resume.addEventListener('click', () => player.play());
+    actions.appendChild(resume);
 
-    const label = document.createElement('div');
-    label.className = 'message-label';
-    label.textContent = sender === 'user' ? '나' : 'AI';
+    const feedback = document.createElement('button');
+    feedback.type = 'button';
+    feedback.className = 'link-btn';
+    feedback.textContent = '교수님께 질문 보내기';
+    feedback.addEventListener('click', () => openFeedback(item));
+    actions.appendChild(feedback);
 
-    const bubble = document.createElement('div');
-    bubble.className = 'message-bubble';
-    if (sender === 'assistant') {
-        renderAnswer(bubble, text);
-    } else {
-        bubble.textContent = text;
-    }
-
-    messageDiv.append(label, bubble);
-    chatMessages.appendChild(messageDiv);
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+    bubble.parentElement.appendChild(actions);
 }
 
-// Close answer overlay
-closeAnswer.addEventListener('click', () => {
-    answerOverlay.classList.remove('active');
-});
+async function ask() {
+    const question = chatInput.value.trim();
+    if (!question || !job || askController) return;
 
-// Feedback handlers
-thumbsUp.addEventListener('click', () => {
-    addChatMessage(currentAnswer, 'assistant');
-    answerOverlay.classList.remove('active');
-    videoPlayer.play();
-    showToast('감사합니다! 영상이 이어서 재생됩니다', 'success');
-});
+    const at = player.time();
+    player.pause();
+    chatInput.value = '';
+    addMessage('user', question, at);
+    const bubble = addMessage('assistant', '');
+    bubble.classList.add('pending');
+    sendBtn.disabled = true;
 
-// Thumbs down - show feedback modal
-thumbsDown.addEventListener('click', () => {
-    showFeedbackModal();
-});
+    const controller = new AbortController();
+    askController = controller;
+    let answer = '';
+    try {
+        const response = await postJSON('/api/ask', {
+            video_id: job.id,
+            question,
+            current_time: at,
+            history: history.slice(-3),
+        }, { signal: controller.signal });
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            throw new Error(data.message || '답변을 가져오지 못했어요.');
+        }
 
-function showFeedbackModal() {
+        let failure = null;
+        await readEventStream(response, (event) => {
+            if (event.delta) {
+                answer += event.delta;
+                renderAnswer(bubble, answer);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+            if (event.error) failure = event.error;
+        });
+        if (failure) throw new Error(failure);
+        if (!answer) throw new Error('빈 답변이 왔어요. 다시 질문해 주세요.');
+
+        history.push({ question, answer });
+        addAnswerActions(bubble, { question, answer, at });
+    } catch (error) {
+        if (error.name !== 'AbortError') bubble.textContent = error.message || '답변을 가져오지 못했어요.';
+    } finally {
+        bubble.classList.remove('pending');
+        if (askController === controller) {
+            askController = null;
+            sendBtn.disabled = !job;
+        }
+    }
+}
+
+// Server-sent events arrive in arbitrary network chunks; split on blank lines.
+async function readEventStream(response, onEvent) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+        let boundary;
+        while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+            const block = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            const payload = block.split('\n')
+                .filter((line) => line.startsWith('data: '))
+                .map((line) => line.slice(6))
+                .join('\n');
+            if (!payload) continue;
+            try {
+                onEvent(JSON.parse(payload));
+            } catch (error) {
+                console.warn('Bad event', payload);
+            }
+        }
+        if (done) break;
+    }
+}
+
+// ---------------------------------------------------------------- professor feedback
+
+function openFeedback(item) {
     const modal = document.createElement('div');
-    modal.className = 'feedback-modal';
+    modal.className = 'modal';
     modal.innerHTML = `
-        <div class="feedback-modal-content">
-            <h3>어떤 점이 불만족스러웠나요?</h3>
-            <textarea placeholder="답변의 어떤 부분이 부족했는지 알려주세요..."></textarea>
-            <div class="feedback-modal-buttons">
-                <button class="btn-cancel">취소</button>
-                <button class="btn-submit">교수님께 문의</button>
+        <div class="modal-content" role="dialog" aria-modal="true">
+            <h3>교수님께 질문 보내기</h3>
+            <p class="modal-hint">질문, AI 답변, 질문한 시점의 강의 내용이 함께 전달돼요.</p>
+            <textarea placeholder="AI 답변에서 부족했던 점이나 더 궁금한 점을 적어 주세요"></textarea>
+            <div class="modal-buttons">
+                <button type="button" class="btn btn-ghost" data-action="cancel">취소</button>
+                <button type="button" class="btn btn-primary" data-action="send">보내기</button>
             </div>
         </div>
     `;
     document.body.appendChild(modal);
-
     const textarea = modal.querySelector('textarea');
-    modal.querySelector('.btn-cancel').addEventListener('click', () => modal.remove());
-    modal.querySelector('.btn-submit').addEventListener('click', () => {
-        const feedbackText = textarea.value.trim();
-        modal.remove();
-        submitFeedback(feedbackText);
+    const sendButton = modal.querySelector('[data-action="send"]');
+    modal.querySelector('[data-action="cancel"]').addEventListener('click', () => modal.remove());
+    modal.addEventListener('click', (event) => {
+        if (event.target === modal) modal.remove();
     });
-
-    setTimeout(() => textarea.focus(), 100);
+    sendButton.addEventListener('click', async () => {
+        sendButton.disabled = true;
+        try {
+            const response = await postJSON('/api/feedback', {
+                video_id: job.id,
+                question: item.question,
+                answer: item.answer,
+                current_time: item.at,
+                user_feedback: textarea.value.trim(),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.message || '보내지 못했어요.');
+            modal.remove();
+            showToast('교수님께 보냈어요.', 'success');
+        } catch (error) {
+            sendButton.disabled = false;
+            showToast(error.message, 'error');
+        }
+    });
+    textarea.focus();
 }
 
-async function submitFeedback(userFeedback) {
-    let ok = false;
-    let message = '교수님께 보내지 못했어요.';
-    try {
-        const response = await fetch('/api/feedback', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                video_id: currentVideoId,
-                question: currentQuestion,
-                answer: currentAnswer,
-                current_time: questionTime,
-                user_feedback: userFeedback
-            })
-        });
-        const data = await response.json().catch(() => ({}));
-        ok = response.ok;
-        if (!ok && data.message) message = data.message;
-    } catch (error) {
-        console.error('Failed to send feedback:', error);
-    }
+// ---------------------------------------------------------------- reset
 
-    addChatMessage(currentAnswer, 'assistant');
-    answerOverlay.classList.remove('active');
+function resetToStart() {
+    clearTimeout(pollTimer);
+    if (askController) askController.abort();
+    if (uploadRequest) uploadRequest.abort();
+    askController = null;
+    uploadRequest = null;
+    job = null;
+    segments = [];
+    history = [];
+    activeIndex = -1;
 
-    if (ok) {
-        showToast('교수님께 문의를 보냈어요', 'success');
-        videoPlayer.play();
-    } else {
-        showToast(message, 'error');
-    }
+    player.destroy();
+    chatMessages.replaceChildren(welcomeMessage.cloneNode(true));
+    transcriptList.replaceChildren(emptyTranscript.cloneNode(true));
+    transcriptMeta.textContent = '';
+    videoTitle.textContent = '';
+    jobStatus.hidden = true;
+    chatInput.value = '';
+    chatInput.disabled = true;
+    sendBtn.disabled = true;
+    chatInput.placeholder = '자막을 만드는 중이에요...';
+
+    workspace.hidden = true;
+    startSection.hidden = false;
+    newVideoBtn.hidden = true;
+    videoInput.value = '';
+    youtubeUrl.value = '';
 }
 
-// Initialize
-disableChat();
+newVideoBtn.addEventListener('click', resetToStart);

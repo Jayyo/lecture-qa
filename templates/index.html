@@ -3,127 +3,96 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>실시간 강의 Q&A</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+    <title>Lecture Q&amp;A</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M12 9v14l11-7z' fill='white'/%3E%3C/svg%3E">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
-    <div class="container">
-        <!-- Header -->
-        <header class="header">
-            <h1>실시간 강의 Q&A</h1>
-            <p class="subtitle">강의 영상을 업로드하고 AI와 대화하세요</p>
-        </header>
+    <header class="topbar">
+        <div class="topbar-inner">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true"></span>
+                <span class="brand-name">Lecture Q&amp;A</span>
+            </div>
+            <p class="video-title" id="videoTitle"></p>
+            <button class="btn btn-ghost" id="newVideoBtn" hidden>새 영상</button>
+        </div>
+    </header>
 
-        <!-- Upload Section -->
-        <section class="upload-section" id="uploadSection">
-            <label class="upload-box" id="uploadBox" for="videoInput">
-                <div class="upload-content">
-                    <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                        <polyline points="17 8 12 3 7 8"/>
-                        <line x1="12" y1="3" x2="12" y2="15"/>
-                    </svg>
-                    <p class="upload-text">클릭하여 동영상 업로드</p>
-                    <p class="upload-hint">또는 YouTube URL 입력</p>
-                </div>
-                <input type="file" id="videoInput" accept="video/mp4,video/webm,video/quicktime" class="visually-hidden">
+    <main class="container">
+        <!-- Start: pick a video -->
+        <section class="start" id="startSection">
+            <h1>강의 영상을 보다가 멈추고 물어보세요</h1>
+            <p class="lead">영상의 음성을 자막으로 만든 뒤, 멈춘 지점까지의 강의 내용을 근거로 답하고 해당 장면으로 바로 이동할 수 있게 해 드려요.</p>
+
+            <label class="drop-zone" id="dropZone" for="videoInput">
+                <span class="drop-title">영상 파일을 끌어다 놓거나 클릭해서 선택</span>
+                <span class="drop-hint" id="limitHint">MP4 또는 WebM</span>
+                <input type="file" id="videoInput" accept="video/mp4,video/webm,video/quicktime,.mp4,.m4v,.mov,.webm" class="visually-hidden">
             </label>
 
-            <!-- YouTube URL Input -->
-            <div class="url-input-section">
-                <div class="url-input-wrapper">
-                    <input type="text" id="youtubeUrl" placeholder="YouTube URL을 입력하세요" class="url-input">
-                    <button id="loadYoutube" class="btn btn-primary">불러오기</button>
-                </div>
-                <p class="duration-hint" id="limitHint"></p>
-            </div>
+            <div class="or"><span>또는</span></div>
+
+            <form class="url-form" id="youtubeForm">
+                <input type="text" id="youtubeUrl" class="text-input" placeholder="YouTube 영상 주소 (예: https://youtu.be/...)" autocomplete="off">
+                <button type="submit" class="btn btn-primary" id="loadYoutube">불러오기</button>
+            </form>
         </section>
 
-        <!-- Video Section (hidden initially) -->
-        <section class="video-section" id="videoSection" hidden>
-            <div class="video-wrapper">
-                <!-- Video Container -->
-                <div class="video-container" id="videoContainer">
-                    <video id="videoPlayer" controls>
-                        <source src="" type="video/mp4">
-                    </video>
-
-                    <!-- Answer Overlay -->
-                    <div class="answer-overlay" id="answerOverlay">
-                        <div class="answer-content">
-                            <div class="answer-header">
-                                <span class="answer-label">AI 답변</span>
-                                <button class="close-answer" id="closeAnswer">×</button>
-                            </div>
-                            <div class="answer-text" id="answerText"></div>
-                            <div class="feedback-buttons" id="feedbackButtons">
-                                <button class="feedback-btn thumbs-up" id="thumbsUp" title="만족 - 영상 이어보기">
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/>
-                                    </svg>
-                                    <span>만족</span>
-                                </button>
-                                <button class="feedback-btn thumbs-down" id="thumbsDown" title="불만족 - 교수님께 문의">
-                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"/>
-                                    </svg>
-                                    <span>불만족</span>
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Transcription Progress -->
-                    <div class="transcription-overlay" id="transcriptionOverlay">
-                        <div class="transcription-content">
-                            <div class="spinner"></div>
-                            <p class="transcription-status" id="transcriptionStatus">영상을 분석하고 있습니다...</p>
-                            <div class="progress-bar">
-                                <div class="progress-fill" id="progressFill"></div>
-                            </div>
-                            <p class="progress-text" id="progressText">0%</p>
-                        </div>
-                    </div>
+        <!-- Workspace: player, transcript and chat -->
+        <section class="workspace" id="workspace" hidden>
+            <div class="main-column">
+                <div class="player" id="playerBox">
+                    <video id="videoPlayer" controls playsinline hidden></video>
+                    <div id="ytMount" class="yt-mount" hidden></div>
                 </div>
 
-                <!-- New Video Button -->
-                <button class="btn btn-new-video" id="newVideoBtn">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="12" y1="5" x2="12" y2="19"/>
-                        <line x1="5" y1="12" x2="19" y2="12"/>
-                    </svg>
-                    새 영상
-                </button>
+                <div class="job-status" id="jobStatus" hidden>
+                    <div class="job-status-row">
+                        <span id="jobStatusText">처리 중...</span>
+                        <span id="jobStatusPercent">0%</span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+                </div>
+
+                <div class="panel transcript-panel">
+                    <div class="panel-header">
+                        <h2>자막</h2>
+                        <span class="panel-meta" id="transcriptMeta"></span>
+                    </div>
+                    <ol class="transcript" id="transcriptList">
+                        <li class="transcript-empty">자막을 만드는 중이에요.</li>
+                    </ol>
+                </div>
             </div>
 
-            <!-- Chat Section -->
-            <div class="chat-section">
+            <aside class="panel chat-panel">
+                <div class="panel-header">
+                    <h2>질문</h2>
+                </div>
                 <div class="chat-messages" id="chatMessages">
                     <div class="welcome-message">
-                        <p>강의 내용에 대해 궁금한 점을 질문해주세요!</p>
-                        <p class="hint">질문하면 영상이 자동으로 일시정지됩니다.</p>
+                        <p>궁금한 곳에서 질문하면 영상이 멈추고, 강의 내용을 근거로 답해 드려요.</p>
+                        <p class="hint">답변의 시간 표시를 누르면 그 장면으로 이동해요.</p>
                     </div>
                 </div>
-                <div class="chat-input-wrapper">
-                    <input type="text" id="chatInput" placeholder="질문을 입력하세요..." class="chat-input" disabled>
-                    <button id="sendBtn" class="btn btn-send" disabled>
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <form class="chat-input-wrapper" id="chatForm">
+                    <input type="text" id="chatInput" class="text-input" placeholder="자막을 만드는 중이에요..." maxlength="1000" autocomplete="off" disabled>
+                    <button type="submit" id="sendBtn" class="btn btn-primary btn-send" aria-label="질문 보내기" disabled>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                             <line x1="22" y1="2" x2="11" y2="13"/>
                             <polygon points="22 2 15 22 11 13 2 9 22 2"/>
                         </svg>
                     </button>
-                </div>
-            </div>
+                </form>
+            </aside>
         </section>
-    </div>
+    </main>
 
-    <!-- Toast Notification -->
-    <div class="toast" id="toast">
-        <span id="toastMessage"></span>
-    </div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script src="/static/js/app.js"></script>
 </body>

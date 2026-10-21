@@ -126,8 +126,10 @@ def security_headers(response):
     response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
     response.headers.setdefault(
         'Content-Security-Policy',
-        "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
-        "font-src https://fonts.gstatic.com; img-src 'self' data:; media-src 'self'; "
+        "default-src 'self'; script-src 'self' https://www.youtube.com; "
+        "frame-src https://www.youtube-nocookie.com https://www.youtube.com; "
+        "style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+        "img-src 'self' data: https://i.ytimg.com; media-src 'self'; "
         "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     )
     return response
@@ -142,18 +144,20 @@ def transcribe_audio(video_path, video_id, title=None):
     """Extract the audio track and transcribe it (runs in a background thread)."""
     wav_path = WORK_FOLDER / f"{video_id}.wav"
 
+    def set_status(progress):
+        transcription_status[video_id] = {'status': 'processing', 'progress': progress, 'title': title}
+
     def progress(fraction):
-        transcription_status[video_id] = {'status': 'processing', 'progress': 30 + int(fraction * 65),
-                                          'message': 'Transcribing...'}
+        set_status(30 + int(fraction * 65))
 
     try:
         logger.info(f"[TRANSCRIBE] Starting | video_id: {video_id}")
-        transcription_status[video_id] = {'status': 'processing', 'progress': 28, 'message': 'Extracting audio...'}
+        set_status(28)
         media.extract_wav(video_path, wav_path, MAX_VIDEO_DURATION)
 
         if USE_LOCAL_WHISPER:
             model = f'whisper-{WHISPER_MODEL} (local)'
-            transcription_status[video_id] = {'status': 'processing', 'progress': 40, 'message': 'Transcribing...'}
+            set_status(40)
             segments = transcribe.transcribe_local(wav_path, WHISPER_MODEL, TRANSCRIBE_LANGUAGE)
         else:
             model = TRANSCRIBE_MODEL
@@ -178,6 +182,7 @@ def transcribe_audio(video_path, video_id, title=None):
         logger.info(f"[TRANSCRIBE] Completed | video_id: {video_id} | model: {model} | segments: {len(segments)}")
 
     except media.MediaError as e:
+        logger.info(f"[TRANSCRIBE] Rejected | video_id: {video_id} | {e}")
         transcription_status[video_id] = {'status': 'error', 'error': str(e)}
     except Exception:
         logger.exception(f"[TRANSCRIBE] Error | video_id: {video_id}")
@@ -187,30 +192,25 @@ def transcribe_audio(video_path, video_id, title=None):
 
 
 def process_youtube_job(youtube_id, video_id):
-    """Download a YouTube video and transcribe it (runs in a background thread)."""
+    """Fetch the audio of a YouTube video and transcribe it (runs in a background thread)."""
     workdir = WORK_FOLDER / video_id
 
     def progress(fraction):
         transcription_status[video_id] = {'status': 'downloading', 'progress': int(fraction * 25)}
 
     try:
-        path, info = media.download_youtube(
+        audio_path, info = media.download_youtube_audio(
             youtube_id, workdir, MAX_VIDEO_DURATION, app.config['MAX_CONTENT_LENGTH'],
             cookies=YTDLP_COOKIES, on_progress=progress)
-        video_path = UPLOAD_FOLDER / f"{video_id}.mp4"
-        shutil.move(str(path), video_path)
-        logger.info(f"[YOUTUBE] Downloaded | video_id: {video_id} | title: {info.get('title')!r}")
+        logger.info(f"[YOUTUBE] Downloaded audio | video_id: {video_id} | title: {info.get('title')!r}")
+        transcribe_audio(audio_path, video_id, title=info.get('title'))
     except media.MediaError as e:
         transcription_status[video_id] = {'status': 'error', 'error': str(e)}
-        return
     except Exception:
         logger.exception(f"[YOUTUBE] Download error | video_id: {video_id}")
         transcription_status[video_id] = {'status': 'error', 'error': 'YouTube 영상을 가져오지 못했어요.'}
-        return
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-
-    transcribe_audio(video_path, video_id, title=info.get('title'))
 
 
 @app.route('/')
@@ -276,7 +276,7 @@ def upload_video():
 
 @app.route('/api/youtube', methods=['POST'])
 def process_youtube():
-    """Process YouTube URL"""
+    """Start transcribing a YouTube video (or reuse an earlier transcript)."""
     data = request.get_json(silent=True) or {}
     youtube_id = media.parse_youtube_url(data.get('url') if isinstance(data.get('url'), str) else '')
     if not youtube_id:
@@ -284,21 +284,20 @@ def process_youtube():
                         'message': '올바른 YouTube 영상 주소를 입력해 주세요. 채널이나 재생목록은 안 돼요.'}), 400
 
     video_id = f"yt-{youtube_id}"
-    video_url = f'/uploads/{video_id}.mp4'
+    result = {'video_id': video_id, 'youtube_id': youtube_id}
     logger.info(f"[YOUTUBE] Request | video_id: {video_id} | IP: {request.remote_addr}")
 
-    if load_transcript(video_id) is not None and (UPLOAD_FOLDER / f"{video_id}.mp4").exists():
-        transcription_status[video_id] = {'status': 'completed', 'progress': 100}
-        return jsonify({'video_id': video_id, 'video_url': video_url, 'cached': True})
+    transcript = load_transcript(video_id)
+    if transcript is not None:
+        return jsonify({**result, 'cached': True, 'title': transcript.get('title')})
 
     # Someone else may have asked for the same video a moment ago
     if transcription_status.get(video_id, {}).get('status') in ('downloading', 'processing'):
-        return jsonify({'video_id': video_id, 'video_url': video_url})
+        return jsonify(result)
 
     transcription_status[video_id] = {'status': 'downloading', 'progress': 0}
     threading.Thread(target=process_youtube_job, args=(youtube_id, video_id), daemon=True).start()
-
-    return jsonify({'video_id': video_id, 'video_url': video_url})
+    return jsonify(result)
 
 
 @app.route('/api/status/<video_id>')

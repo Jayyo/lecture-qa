@@ -208,10 +208,11 @@ def _youtube_error(err):
     return 'YouTube 영상을 가져오지 못했어요.'
 
 
-def download_youtube(video_id, workdir, max_seconds, max_bytes, cookies=None, on_progress=None):
-    """Download a YouTube video (720p at most) into `workdir`.
+def download_youtube_audio(video_id, workdir, max_seconds, max_bytes, cookies=None, on_progress=None):
+    """Download only the audio track of a YouTube video into `workdir`.
 
-    Returns (path, info) where info has the title and duration.
+    The page plays the video through YouTube's own embed, so the server never
+    stores or re-serves the video itself. Returns (path, info).
     """
     import yt_dlp
 
@@ -225,10 +226,8 @@ def download_youtube(video_id, workdir, max_seconds, max_bytes, cookies=None, on
                 on_progress(min(d.get('downloaded_bytes', 0) / total, 1.0))
 
     opts = {
-        'format': ('bv*[height<=720][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/'
-                   'b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]'),
-        'merge_output_format': 'mp4',
-        'outtmpl': {'default': str(workdir / 'video.%(ext)s')},
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+        'outtmpl': {'default': str(workdir / 'audio.%(ext)s')},
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
@@ -261,6 +260,8 @@ def download_youtube(video_id, workdir, max_seconds, max_bytes, cookies=None, on
             raise MediaError('영상 길이를 확인할 수 없어요.')
         if duration > max_seconds:
             raise MediaError(f'{int(max_seconds // 60)}분 이하의 영상만 처리할 수 있어요.')
+        if info.get('playable_in_embed') is False:
+            raise MediaError('영상 소유자가 다른 사이트에서의 재생을 막아 두었어요. 영상 파일을 직접 올려 주세요.')
 
         try:
             info = ydl.process_ie_result(info, download=True)
@@ -270,5 +271,5 @@ def download_youtube(video_id, workdir, max_seconds, max_bytes, cookies=None, on
     downloads = info.get('requested_downloads') or []
     path = Path(downloads[0]['filepath']) if downloads else None
     if not path or not path.is_file():
-        raise MediaError('YouTube 영상을 가져오지 못했어요. 파일이 너무 클 수 있어요.')
+        raise MediaError('YouTube 오디오를 가져오지 못했어요. 파일이 너무 클 수 있어요.')
     return path, {'title': info.get('title'), 'duration': duration}

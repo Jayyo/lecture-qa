@@ -16,7 +16,7 @@ from flask import Flask, request, jsonify, Response, stream_with_context, send_f
 from openai import OpenAI
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from . import media, transcribe
+from . import media, qa, transcribe
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,6 +65,12 @@ YTDLP_COOKIES = os.getenv('YTDLP_COOKIES')
 # gpt-transcribe gives the best text but no timestamps; see transcribe.py
 TRANSCRIBE_MODEL = os.getenv('TRANSCRIBE_MODEL', 'gpt-transcribe')
 TRANSCRIBE_LANGUAGE = os.getenv('TRANSCRIBE_LANGUAGE') or None
+
+# Answers come from the Responses API. gpt-6.1-sol only accepts low..max effort;
+# gpt-6-luna with CHAT_REASONING_EFFORT=none is the faster, cheaper option.
+CHAT_MODEL = os.getenv('CHAT_MODEL', 'gpt-6.1-sol')
+CHAT_REASONING_EFFORT = os.getenv('CHAT_REASONING_EFFORT', 'low')
+CHAT_MAX_OUTPUT_TOKENS = env_int('CHAT_MAX_OUTPUT_TOKENS', 1000)
 
 # Optional offline transcription with openai-whisper (tiny, base, small, medium, large)
 USE_LOCAL_WHISPER = os.getenv('USE_LOCAL_WHISPER', 'false').lower() == 'true'
@@ -161,7 +167,6 @@ def transcribe_audio(video_path, video_id, title=None):
             'title': title,
             'duration': round(media.wav_duration(wav_path), 2),
             'segments': segments,
-            'full_text': ' '.join(seg['text'] for seg in segments),
         }
         tmp = transcript_path(video_id).with_suffix('.tmp')
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -319,20 +324,12 @@ def get_transcript(video_id):
 
 
 def get_context_at_timestamp(video_id, current_time):
-    """Get transcript context around current timestamp"""
+    """The last ~500 characters of the lecture before `current_time` (used in the professor mail)."""
     data = load_transcript(video_id)
     if not data:
         return ""
-
-    # Segments heard so far, plus the one playing right now
-    context_segments = [seg['text'] for seg in data.get('segments', []) if seg['start'] <= current_time + 10]
-
-    # Return last ~2000 chars of context
-    context = ' '.join(context_segments)
-    if len(context) > 2000:
-        context = context[-2000:]
-
-    return context
+    text = ' '.join(seg['text'] for seg in data.get('segments', []) if seg['start'] <= current_time)
+    return text[-500:]
 
 
 def parse_time(value):
@@ -343,9 +340,23 @@ def parse_time(value):
     return t if math.isfinite(t) and t >= 0 else 0.0
 
 
+def parse_history(value):
+    """Up to three earlier question/answer pairs sent back by the page."""
+    turns = []
+    if isinstance(value, list):
+        for turn in value[-3:]:
+            if isinstance(turn, dict) and isinstance(turn.get('question'), str) and isinstance(turn.get('answer'), str):
+                turns.append({'question': turn['question'][:1000], 'answer': turn['answer'][:2000]})
+    return turns
+
+
+def sse(payload):
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @app.route('/api/ask', methods=['POST'])
 def ask_question():
-    """Answer question about video content - streaming response"""
+    """Answer a question about the lecture, streamed as server-sent events."""
     data = request.get_json(silent=True) or {}
     video_id = data.get('video_id')
     question = data.get('question')
@@ -359,51 +370,17 @@ def ask_question():
     if transcript is None:
         return jsonify({'error': 'Transcript not available'}), 404
 
-    context = get_context_at_timestamp(video_id, current_time)
-    full_transcript = transcript.get('full_text', '')
-
-    system_prompt = """너는 이 강의를 진행하는 선생님이야. 학생이 강의 중에 손을 들고 질문한 거라고 생각해.
-
-답변 규칙:
-1. 마크다운 문법(**, ##, - 등) 절대 사용하지 마. 그냥 평문으로만 답변해.
-2. 핵심만 짧게 2-4문장으로 답변해. 길게 설명하지 마.
-3. 강의에서 다룬 내용 위주로, 선생님이 직접 말하듯이 친근하게 답변해.
-4. 강의 내용과 관련 없으면 "그건 이 강의 내용이 아니야. 강의 관련 질문해줘!" 라고 해.
-5. 반말로 답변해."""
-
-    user_prompt = f"""[강의 내용]
-{full_transcript[:2000]}
-
-[현재까지 들은 부분]
-{context}
-
-[학생 질문]
-{question}
-
-선생님처럼 핵심만 짧게 답변해."""
+    prompt = qa.build_input(transcript['segments'], current_time, question,
+                            history=parse_history(data.get('history')), title=transcript.get('title'))
 
     def generate():
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.7,
-                max_tokens=300,
-                stream=True
-            )
-
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield f"data: {json.dumps({'content': chunk.choices[0].delta.content})}\n\n"
-
-            yield f"data: {json.dumps({'done': True})}\n\n"
-
+            for delta in qa.stream_answer(client, CHAT_MODEL, prompt, CHAT_REASONING_EFFORT, CHAT_MAX_OUTPUT_TOKENS):
+                yield sse({'delta': delta})
+            yield sse({'done': True})
         except Exception:
             logger.exception(f"[ASK] Error | video_id: {video_id}")
-            yield f"data: {json.dumps({'error': '답변을 만들지 못했어요. 잠시 후 다시 시도해 주세요.'})}\n\n"
+            yield sse({'error': '답변을 만들지 못했어요. 잠시 후 다시 시도해 주세요.'})
 
     return Response(
         stream_with_context(generate()),

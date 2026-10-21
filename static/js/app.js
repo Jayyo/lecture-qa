@@ -6,6 +6,7 @@ let isTranscribing = false;
 let statusCheckInterval = null;
 let questionTime = 0;
 let isAsking = false;
+let history = [];
 
 // DOM Elements
 const uploadBox = document.getElementById('uploadBox');
@@ -246,6 +247,7 @@ function resetToUpload() {
     currentVideoId = null;
     currentAnswer = '';
     currentQuestion = '';
+    history = [];
     isTranscribing = false;
 
     if (statusCheckInterval) {
@@ -306,7 +308,8 @@ async function sendQuestion() {
             body: JSON.stringify({
                 video_id: currentVideoId,
                 question: question,
-                current_time: questionTime
+                current_time: questionTime,
+                history: history.slice(-3)
             })
         });
 
@@ -316,14 +319,17 @@ async function sendQuestion() {
         }
 
         await readEventStream(response, (data) => {
-            if (data.content) {
-                currentAnswer += data.content;
-                answerText.textContent = currentAnswer;
+            if (data.delta) {
+                currentAnswer += data.delta;
+                renderAnswer(answerText, currentAnswer);
             }
             if (data.error) {
                 answerText.textContent = data.error;
             }
         });
+        if (currentAnswer) {
+            history.push({ question, answer: currentAnswer });
+        }
     } catch (error) {
         answerText.textContent = '답변을 가져오는 중 오류가 발생했습니다.';
         console.error(error);
@@ -364,6 +370,34 @@ async function readEventStream(response, onEvent) {
     }
 }
 
+// Answers cite moments like [03:12]; turn those into buttons that jump there.
+const TIMESTAMP_RE = /\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:\s*[-–~]\s*(?:\d{1,2}:)?\d{1,2}:\d{2})?\]/g;
+
+function renderAnswer(element, text) {
+    const duration = Number.isFinite(videoPlayer.duration) ? videoPlayer.duration : Infinity;
+    const nodes = [];
+    let last = 0;
+    for (const match of text.matchAll(TIMESTAMP_RE)) {
+        const seconds = (Number(match[1] || 0) * 3600) + Number(match[2]) * 60 + Number(match[3]);
+        if (seconds > duration) continue;
+        nodes.push(document.createTextNode(text.slice(last, match.index)));
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'timestamp-chip';
+        chip.textContent = match[0].slice(1, -1);
+        chip.title = '이 부분으로 이동';
+        chip.addEventListener('click', () => {
+            videoPlayer.currentTime = seconds;
+            answerOverlay.classList.remove('active');
+            videoPlayer.play();
+        });
+        nodes.push(chip);
+        last = match.index + match[0].length;
+    }
+    nodes.push(document.createTextNode(text.slice(last)));
+    element.replaceChildren(...nodes);
+}
+
 function addChatMessage(text, sender) {
     // Remove welcome message if exists
     const welcome = chatMessages.querySelector('.welcome-message');
@@ -378,7 +412,11 @@ function addChatMessage(text, sender) {
 
     const bubble = document.createElement('div');
     bubble.className = 'message-bubble';
-    bubble.textContent = text;
+    if (sender === 'assistant') {
+        renderAnswer(bubble, text);
+    } else {
+        bubble.textContent = text;
+    }
 
     messageDiv.append(label, bubble);
     chatMessages.appendChild(messageDiv);

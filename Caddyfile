@@ -1,3 +1,8 @@
-lecture-qa.example.com {
-    reverse_proxy lecture-qa:5000
+# DOMAIN and MAX_UPLOAD_MB come from .env via docker-compose.yml
+{$DOMAIN:localhost} {
+	request_body {
+		max_size {$MAX_UPLOAD_MB:300}MiB
+	}
+	header -Server
+	reverse_proxy app:5000
 }

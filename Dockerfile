@@ -1,48 +1,40 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Install system dependencies for yt-dlp, ffmpeg, and Whisper
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    curl \
-    git \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp needs a JavaScript runtime to read YouTube's player code
+COPY --from=denoland/deno:bin-2.9.7 /deno /usr/local/bin/deno
 
 WORKDIR /app
 
-# Copy requirements first for caching
-COPY requirements.txt .
-
-# Install PyTorch CPU version first (smaller, faster for CPU-only servers)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-
-# Install other requirements
+COPY requirements.txt requirements-local-whisper.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Optional offline transcription: docker compose build --build-arg LOCAL_WHISPER=true
+ARG LOCAL_WHISPER=false
+RUN if [ "$LOCAL_WHISPER" = "true" ]; then \
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+        && pip install --no-cache-dir -r requirements-local-whisper.txt; \
+    fi
+
 COPY backend/ ./backend/
 COPY static/ ./static/
 COPY templates/ ./templates/
 
-# Copy YouTube cookies for authenticated downloads (optional)
-COPY cookies.txt* ./
+RUN useradd --create-home --uid 10001 app \
+    && mkdir -p /app/data \
+    && chown app:app /app/data
+USER app
 
-# Create directories for uploads, transcripts, and data
-RUN mkdir -p uploads transcripts data
-
-# Environment variables for local Whisper
-# Set USE_LOCAL_WHISPER=true to use local model instead of OpenAI API
-# WHISPER_MODEL options: tiny (fastest), base, small (default), medium, large (best quality)
-ENV USE_LOCAL_WHISPER=false
-ENV WHISPER_MODEL=small
-
-# Expose port
+ENV DATA_DIR=/app/data \
+    PYTHONUNBUFFERED=1
 EXPOSE 5000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5000/ || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz', timeout=4)"
 
-# Run with gunicorn
-# IMPORTANT: Use single worker (--workers 1) to share transcription_status dict in memory
-# Multiple workers have separate memory spaces, causing status polling to fail
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "600", "backend.app:app"]
+# A single worker on purpose: job status lives in this process's memory
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "8", \
+     "--timeout", "120", "--worker-tmp-dir", "/dev/shm", "backend.app:app"]

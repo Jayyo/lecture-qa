@@ -336,6 +336,11 @@ def index():
     return send_from_directory(app.template_folder, 'index.html')
 
 
+@app.route('/healthz')
+def healthz():
+    return 'ok'
+
+
 @app.route('/api/config')
 def get_config():
     return jsonify({

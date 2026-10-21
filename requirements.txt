@@ -1,6 +1,7 @@
-flask==3.0.0
-openai==1.82.0
-yt-dlp>=2024.11.18
-python-dotenv==1.0.0
-gunicorn==21.2.0
-requests>=2.32.2
+flask==3.1.3
+gunicorn==26.2.0
+openai==3.36.0
+python-dotenv==1.2.4
+requests==2.34.2
+# YouTube changes often; keep yt-dlp current. [default] pulls in yt-dlp-ejs.
+yt-dlp[default]>=2026.8.19

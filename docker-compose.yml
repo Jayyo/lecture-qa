@@ -1,48 +1,41 @@
-version: '3.8'
-
 services:
-  lecture-qa:
+  app:
     build: .
-    container_name: lecture-qa
-    expose:
-      - "5000"
-    env_file:
-      - .env
+    env_file: .env
     environment:
-      - FLASK_ENV=production
-      - TZ=Asia/Seoul
-      # Local Whisper settings (uncomment to enable)
-      # - USE_LOCAL_WHISPER=true
-      # - WHISPER_MODEL=small  # tiny, base, small, medium, large
+      TRUST_PROXY: "1"
+      TZ: Asia/Seoul
     volumes:
-      - ./uploads:/app/uploads
-      - ./transcripts:/app/transcripts
-      - ./data:/app/data
+      - app-data:/app/data
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    # Increase shared memory for PyTorch (needed for Whisper)
-    shm_size: '2gb'
 
   caddy:
     image: caddy:2
-    container_name: caddy
     ports:
       - "80:80"
       - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
+      - "443:443/udp"
     environment:
-      - TZ=Asia/Seoul
+      DOMAIN: ${DOMAIN:-localhost}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-300}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
     restart: unless-stopped
     depends_on:
-      - lecture-qa
+      - app
 
 volumes:
-  caddy_data:
-  caddy_config:
+  app-data:
+  caddy-data:
+  caddy-config:

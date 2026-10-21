@@ -32,6 +32,15 @@ const thumbsDown = document.getElementById('thumbsDown');
 const feedbackButtons = document.getElementById('feedbackButtons');
 const welcomeMessage = chatMessages.querySelector('.welcome-message').cloneNode(true);
 
+// Show the server's limits under the URL box
+fetch('/api/config')
+    .then(response => response.json())
+    .then(config => {
+        document.getElementById('limitHint').textContent =
+            `* ${config.max_minutes}분 이하, ${config.max_upload_mb}MB 이하의 MP4/WebM 영상을 지원합니다`;
+    })
+    .catch(() => {});
+
 // Toast notification
 function showToast(message, type = 'default') {
     const toast = document.getElementById('toast');
@@ -76,7 +85,7 @@ videoInput.addEventListener('change', async (e) => {
             videoPlayer.load();
             startStatusCheck();
         } else {
-            showToast(data.error || '업로드 실패', 'error');
+            showToast(data.message || data.error || '업로드 실패', 'error');
             resetToUpload();
         }
     } catch (error) {
@@ -124,12 +133,7 @@ loadYoutube.addEventListener('click', async () => {
                 startStatusCheck();
             }
         } else {
-            // Handle specific error types
-            if (data.error === 'duration_exceeded') {
-                showToast(data.message || '5분 이하의 동영상만 불러올 수 있습니다.', 'error');
-            } else {
-                showToast(data.message || data.error || '불러오기 실패', 'error');
-            }
+            showToast(data.message || data.error || '불러오기 실패', 'error');
             resetToUpload();
         }
     } catch (error) {

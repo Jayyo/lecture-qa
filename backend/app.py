@@ -3,6 +3,7 @@ import json
 import math
 import re
 import secrets
+import shutil
 import subprocess
 import threading
 import logging
@@ -14,6 +15,8 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory
 from openai import OpenAI
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+from . import media
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,14 +56,18 @@ if os.getenv('TRUST_PROXY') == '1':
 DATA_DIR = Path(os.getenv('DATA_DIR', BASE_DIR / 'data')).resolve()
 UPLOAD_FOLDER = DATA_DIR / 'uploads'
 TRANSCRIPT_FOLDER = DATA_DIR / 'transcripts'
-UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
-TRANSCRIPT_FOLDER.mkdir(parents=True, exist_ok=True)
+WORK_FOLDER = DATA_DIR / 'work'
+for folder in (UPLOAD_FOLDER, TRANSCRIPT_FOLDER, WORK_FOLDER):
+    folder.mkdir(parents=True, exist_ok=True)
 
-# Video ids are 32 hex chars; anything else never reaches the filesystem
-VIDEO_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+# Uploads get 32 random hex chars, YouTube videos "yt-" + their video id.
+# Anything else never reaches the filesystem.
+VIDEO_ID_RE = re.compile(r'^(?:[0-9a-f]{32}|yt-[A-Za-z0-9_-]{11})$')
+MEDIA_NAME_RE = re.compile(r'^(?P<id>[0-9a-f]{32}|yt-[A-Za-z0-9_-]{11})\.(?:mp4|webm)$')
 
-# Maximum video duration in seconds (5 minutes)
-MAX_VIDEO_DURATION = 300
+MAX_VIDEO_MINUTES = env_int('MAX_VIDEO_MINUTES', 20)
+MAX_VIDEO_DURATION = MAX_VIDEO_MINUTES * 60
+YTDLP_COOKIES = os.getenv('YTDLP_COOKIES')
 
 # Whisper configuration
 # USE_LOCAL_WHISPER: Set to 'true' to use local Whisper model instead of OpenAI API
@@ -136,47 +143,6 @@ def security_headers(response):
 @app.errorhandler(413)
 def too_large(_):
     return jsonify({'error': 'too_large', 'message': f'{MAX_UPLOAD_MB}MB 이하의 파일만 올릴 수 있어요.'}), 413
-
-
-def is_valid_youtube_video_url(url):
-    """
-    Check if URL is a valid YouTube video URL (not channel/playlist).
-    Returns (is_valid, error_message)
-    """
-    # Patterns for invalid URLs (channels, playlists, etc.)
-    invalid_patterns = [
-        r'youtube\.com/channel/',
-        r'youtube\.com/c/',
-        r'youtube\.com/user/',
-        r'youtube\.com/@',
-        r'youtube\.com/playlist',
-        r'youtube\.com/feed/',
-        r'youtube\.com/results',
-    ]
-
-    for pattern in invalid_patterns:
-        if re.search(pattern, url, re.IGNORECASE):
-            return False, '채널이나 재생목록이 아닌 개별 영상 URL을 입력해주세요.'
-
-    # Patterns for valid video URLs
-    valid_patterns = [
-        r'youtube\.com/watch\?v=[\w-]+',
-        r'youtu\.be/[\w-]+',
-        r'youtube\.com/shorts/[\w-]+',
-        r'youtube\.com/embed/[\w-]+',
-    ]
-
-    for pattern in valid_patterns:
-        if re.search(pattern, url, re.IGNORECASE):
-            return True, None
-
-    return False, '올바른 YouTube 영상 URL을 입력해주세요.'
-
-
-def get_video_hash(video_path_or_url):
-    """Generate a stable id for a YouTube URL"""
-    import hashlib
-    return hashlib.md5(video_path_or_url.encode()).hexdigest()
 
 
 def transcribe_with_local_whisper(audio_path, video_id):
@@ -350,15 +316,12 @@ def transcribe_with_openai_api(audio_path, video_id):
 
 def transcribe_audio(video_path, video_id):
     """Transcribe video audio using local Whisper or OpenAI API"""
-    audio_path = str(UPLOAD_FOLDER / f"{video_id}.mp3")
+    audio_path = str(WORK_FOLDER / f"{video_id}.mp3")
     try:
         logger.info(f"[TRANSCRIBE] Starting | video_id: {video_id}")
         transcription_status[video_id] = {'status': 'processing', 'progress': 35, 'message': 'Extracting audio...'}
 
-        subprocess.run([
-            'ffmpeg', '-nostdin', '-i', str(video_path), '-vn', '-acodec', 'libmp3lame',
-            '-q:a', '4', '-y', audio_path
-        ], check=True, capture_output=True)
+        media.extract_audio(video_path, audio_path, MAX_VIDEO_DURATION)
 
         audio_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
         logger.info(f"[TRANSCRIBE] Audio extracted | video_id: {video_id} | size: {audio_size/1024/1024:.2f}MB")
@@ -375,6 +338,8 @@ def transcribe_audio(video_path, video_id):
         transcription_status[video_id] = {'status': 'completed', 'progress': 100}
         logger.info(f"[TRANSCRIBE] Completed | video_id: {video_id} | segments: {len(transcript_data.get('segments', []))}")
 
+    except media.MediaError as e:
+        transcription_status[video_id] = {'status': 'error', 'error': str(e)}
     except Exception:
         logger.exception(f"[TRANSCRIBE] Error | video_id: {video_id}")
         transcription_status[video_id] = {'status': 'error', 'error': '음성을 텍스트로 바꾸지 못했어요.'}
@@ -383,75 +348,31 @@ def transcribe_audio(video_path, video_id):
             os.remove(audio_path)
 
 
-def get_video_duration(url, yt_dlp_path='yt-dlp'):
-    """Get video duration in seconds using yt-dlp"""
-    try:
-        result = subprocess.run([
-            yt_dlp_path, '--no-playlist', '--get-duration', url
-        ], capture_output=True, text=True, timeout=30)
+def process_youtube_job(youtube_id, video_id):
+    """Download a YouTube video and transcribe it (runs in a background thread)."""
+    workdir = WORK_FOLDER / video_id
 
-        if result.returncode == 0:
-            duration_str = result.stdout.strip()
-            # Parse duration like "3:33" or "1:23:45"
-            parts = duration_str.split(':')
-            if len(parts) == 2:
-                return int(parts[0]) * 60 + int(parts[1])
-            elif len(parts) == 3:
-                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-            elif len(parts) == 1:
-                return int(parts[0])
-        return None
-    except Exception as e:
-        logger.warning(f"Duration check error: {e}")
-        return None
-
-
-def download_youtube_video(url, video_id, yt_dlp_path='yt-dlp'):
-    """Download YouTube video using yt-dlp with progress tracking"""
-    output_path = UPLOAD_FOLDER / f"{video_id}.mp4"
-
-    # Cookie file path for YouTube authentication (to bypass bot detection)
-    cookies_file = BASE_DIR / 'cookies.txt'
+    def progress(fraction):
+        transcription_status[video_id] = {'status': 'downloading', 'progress': int(fraction * 25)}
 
     try:
-        cmd = [
-            yt_dlp_path, '--no-playlist',
-            '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
-            '--newline', '--progress',
-            '--merge-output-format', 'mp4',
-        ]
-
-        if cookies_file.exists():
-            cmd.extend(['--cookies', str(cookies_file)])
-
-        cmd.extend(['-o', str(output_path), url])
-
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
-
-        for line in process.stdout:
-            line = line.strip()
-            # Parse download progress from yt-dlp output
-            if '[download]' in line and '%' in line:
-                match = re.search(r'(\d+\.?\d*)%', line)
-                if match:
-                    # Scale download progress to 0-25% of total
-                    transcription_status[video_id] = {
-                        'status': 'downloading',
-                        'progress': int(float(match.group(1)) * 0.25)
-                    }
-
-        process.wait()
-
-        if process.returncode == 0:
-            transcription_status[video_id] = {'status': 'downloading', 'progress': 25}
-            return output_path
-        logger.warning(f"[YOUTUBE] yt-dlp exited with {process.returncode} | video_id: {video_id}")
-        return None
+        path, info = media.download_youtube(
+            youtube_id, workdir, MAX_VIDEO_DURATION, app.config['MAX_CONTENT_LENGTH'],
+            cookies=YTDLP_COOKIES, on_progress=progress)
+        video_path = UPLOAD_FOLDER / f"{video_id}.mp4"
+        shutil.move(str(path), video_path)
+        logger.info(f"[YOUTUBE] Downloaded | video_id: {video_id} | title: {info.get('title')!r}")
+    except media.MediaError as e:
+        transcription_status[video_id] = {'status': 'error', 'error': str(e)}
+        return
     except Exception:
         logger.exception(f"[YOUTUBE] Download error | video_id: {video_id}")
-        return None
+        transcription_status[video_id] = {'status': 'error', 'error': 'YouTube 영상을 가져오지 못했어요.'}
+        return
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    transcribe_audio(video_path, video_id)
 
 
 @app.route('/')
@@ -459,10 +380,17 @@ def index():
     return send_from_directory(app.template_folder, 'index.html')
 
 
+@app.route('/api/config')
+def get_config():
+    return jsonify({
+        'max_minutes': MAX_VIDEO_MINUTES,
+        'max_upload_mb': MAX_UPLOAD_MB,
+    })
+
+
 @app.route('/uploads/<filename>')
 def serve_uploads(filename):
-    video_id, _, ext = filename.partition('.')
-    if ext != 'mp4' or not valid_video_id(video_id):
+    if not MEDIA_NAME_RE.match(filename):
         return jsonify({'error': 'Not found'}), 404
     return send_from_directory(UPLOAD_FOLDER, filename)
 
@@ -476,13 +404,25 @@ def upload_video():
     file = request.files['video']
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
+    if Path(file.filename).suffix.lower() not in media.UPLOAD_EXTENSIONS:
+        return jsonify({'error': 'unsupported', 'message': 'MP4 또는 WebM 영상만 올릴 수 있어요.'}), 400
 
     video_id = secrets.token_hex(16)
-    filename = f"{video_id}.mp4"
-    filepath = UPLOAD_FOLDER / filename
-    file.save(filepath)
+    tmp_path = WORK_FOLDER / f"{video_id}.upload"
+    file.save(tmp_path)
+    try:
+        demuxer, duration = media.probe(tmp_path)
+        if duration > MAX_VIDEO_DURATION:
+            raise media.MediaError(f'{MAX_VIDEO_MINUTES}분 이하의 영상만 처리할 수 있어요.')
+    except media.MediaError as e:
+        tmp_path.unlink(missing_ok=True)
+        return jsonify({'error': 'invalid_media', 'message': str(e)}), 400
 
-    logger.info(f"[UPLOAD] Saved | video_id: {video_id} | size: {filepath.stat().st_size/1024/1024:.2f}MB | IP: {request.remote_addr}")
+    filename = f"{video_id}{media.DEMUXERS[demuxer]}"
+    filepath = UPLOAD_FOLDER / filename
+    tmp_path.replace(filepath)
+
+    logger.info(f"[UPLOAD] Saved | video_id: {video_id} | {duration:.0f}s | {filepath.stat().st_size/1024/1024:.2f}MB | IP: {request.remote_addr}")
 
     # Start transcription in background
     transcription_status[video_id] = {'status': 'processing', 'progress': 10}
@@ -499,58 +439,27 @@ def upload_video():
 def process_youtube():
     """Process YouTube URL"""
     data = request.get_json(silent=True) or {}
-    url = data.get('url')
+    youtube_id = media.parse_youtube_url(data.get('url') if isinstance(data.get('url'), str) else '')
+    if not youtube_id:
+        return jsonify({'error': 'invalid_url',
+                        'message': '올바른 YouTube 영상 주소를 입력해 주세요. 채널이나 재생목록은 안 돼요.'}), 400
 
-    if not isinstance(url, str) or not url.strip():
-        return jsonify({'error': 'No URL provided'}), 400
-    url = url.strip()
+    video_id = f"yt-{youtube_id}"
+    video_url = f'/uploads/{video_id}.mp4'
+    logger.info(f"[YOUTUBE] Request | video_id: {video_id} | IP: {request.remote_addr}")
 
-    logger.info(f"[YOUTUBE] Request | URL: {url} | IP: {request.remote_addr}")
-
-    # Validate YouTube URL (reject channels, playlists, etc.)
-    is_valid, error_msg = is_valid_youtube_video_url(url)
-    if not is_valid:
-        return jsonify({'error': 'invalid_url', 'message': error_msg}), 400
-
-    video_id = get_video_hash(url)
-
-    # Check if already transcribed
-    if load_transcript(video_id) is not None:
+    if load_transcript(video_id) is not None and (UPLOAD_FOLDER / f"{video_id}.mp4").exists():
         transcription_status[video_id] = {'status': 'completed', 'progress': 100}
-        if (UPLOAD_FOLDER / f"{video_id}.mp4").exists():
-            return jsonify({
-                'video_id': video_id,
-                'video_url': f'/uploads/{video_id}.mp4',
-                'cached': True,
-                'message': 'Video already transcribed'
-            })
+        return jsonify({'video_id': video_id, 'video_url': video_url, 'cached': True})
 
-    # Check video duration before downloading
-    duration = get_video_duration(url)
-    if duration and duration > MAX_VIDEO_DURATION:
-        return jsonify({
-            'error': 'duration_exceeded',
-            'message': '5분 이하의 동영상만 불러올 수 있습니다.',
-            'duration': duration
-        }), 400
+    # Someone else may have asked for the same video a moment ago
+    if transcription_status.get(video_id, {}).get('status') in ('downloading', 'processing'):
+        return jsonify({'video_id': video_id, 'video_url': video_url})
 
-    logger.info(f"[YOUTUBE] Starting download | video_id: {video_id} | duration: {duration}s")
     transcription_status[video_id] = {'status': 'downloading', 'progress': 0}
+    threading.Thread(target=process_youtube_job, args=(youtube_id, video_id), daemon=True).start()
 
-    def process():
-        video_path = download_youtube_video(url, video_id)
-        if video_path:
-            transcribe_audio(video_path, video_id)
-        else:
-            transcription_status[video_id] = {'status': 'error', 'error': '영상을 다운로드하지 못했어요.'}
-
-    threading.Thread(target=process, daemon=True).start()
-
-    return jsonify({
-        'video_id': video_id,
-        'video_url': f'/uploads/{video_id}.mp4',
-        'message': 'Download and transcription started'
-    })
+    return jsonify({'video_id': video_id, 'video_url': video_url})
 
 
 @app.route('/api/status/<video_id>')

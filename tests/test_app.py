@@ -1,4 +1,6 @@
 import json
+import os
+import time
 
 import pytest
 
@@ -118,6 +120,7 @@ def test_ask_streams_answer_and_feedback_uses_stored_answer(client, transcript, 
 
     def fake_post(url, headers, json, timeout):
         sent.append(json)
+        assert headers['Idempotency-Key'] == f'lecture-qa-{answer_id}'
         return FakeResponse()
 
     monkeypatch.setattr(app_module, 'FEEDBACK_ENABLED', True)
@@ -151,3 +154,56 @@ def test_question_rate_limit(client, transcript, monkeypatch):
     monkeypatch.setattr(app_module.qa, 'stream_answer', lambda *args: iter(['ok']))
     codes = [client.post('/api/ask', json={'video_id': VIDEO_ID, 'question': 'q'}).status_code for _ in range(3)]
     assert codes == [200, 200, 429]
+
+
+@pytest.mark.parametrize('body', ['["x"]', '"x"', '1', 'null'])
+@pytest.mark.parametrize('path', ['/api/youtube', '/api/ask', '/api/feedback'])
+def test_non_object_json_is_a_client_error(client, monkeypatch, path, body):
+    monkeypatch.setattr(app_module, 'FEEDBACK_ENABLED', True)
+    response = client.post(path, data=body, content_type='application/json')
+    assert 400 <= response.status_code < 500
+
+
+def test_json_bodies_are_small(client):
+    big = json.dumps({'url': 'x' * (app_module.MAX_JSON_BYTES + 10)})
+    assert client.post('/api/youtube', data=big, content_type='application/json').status_code == 413
+
+
+def test_answer_slots_are_released(client, transcript, monkeypatch):
+    monkeypatch.setattr(app_module.qa, 'stream_answer', lambda *args: iter(['ok']))
+    for _ in range(app_module.MAX_CONCURRENT_ANSWERS + 2):
+        response = client.post('/api/ask', json={'video_id': VIDEO_ID, 'question': 'q'})
+        assert response.status_code == 200
+        response.get_data()
+        response.close()
+
+
+def test_answer_slots_limit_concurrent_streams(client, transcript, monkeypatch):
+    monkeypatch.setattr(app_module.qa, 'stream_answer', lambda *args: iter(['ok']))
+    held = []
+    while app_module.answer_slots.acquire(blocking=False):
+        held.append(1)
+    try:
+        response = client.post('/api/ask', json={'video_id': VIDEO_ID, 'question': 'q'})
+        assert response.status_code == 503
+    finally:
+        for _ in held:
+            app_module.answer_slots.release()
+
+
+def test_cleanup_skips_running_jobs(monkeypatch):
+    old = time.time() - (app_module.RETENTION_HOURS + 1) * 3600
+    stale = app_module.UPLOAD_FOLDER / ('a' * 32 + '.mp4')
+    running = app_module.UPLOAD_FOLDER / ('b' * 32 + '.mp4')
+    for path in (stale, running):
+        path.write_bytes(b'x')
+        os.utime(path, (old, old))
+    app_module.transcription_status['c' * 32] = {'status': 'error', 'updated': old}
+    monkeypatch.setattr(app_module, 'pending_jobs', {'b' * 32})
+
+    app_module.cleanup_old_files()
+
+    assert not stale.exists()
+    assert running.exists()
+    assert 'c' * 32 not in app_module.transcription_status
+    running.unlink()

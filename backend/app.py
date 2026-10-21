@@ -63,7 +63,10 @@ MEDIA_NAME_RE = re.compile(r'(?:[0-9a-f]{32}|yt-[A-Za-z0-9_-]{11})\.(?:mp4|webm)
 
 MAX_VIDEO_MINUTES = env_int('MAX_VIDEO_MINUTES', 20)
 MAX_VIDEO_DURATION = MAX_VIDEO_MINUTES * 60
+MAX_JSON_BYTES = 64 * 1024
 YTDLP_COOKIES = os.getenv('YTDLP_COOKIES')
+if YTDLP_COOKIES and not Path(YTDLP_COOKIES).is_file():
+    logger.warning(f"YTDLP_COOKIES points to {YTDLP_COOKIES}, which does not exist; ignoring it")
 
 # gpt-transcribe gives the best text but no timestamps; see transcribe.py
 TRANSCRIBE_MODEL = os.getenv('TRANSCRIBE_MODEL', 'gpt-transcribe')
@@ -86,6 +89,8 @@ EMAIL_RE = re.compile(r'[^@\s<>"]{1,64}@[^@\s<>"]{1,190}\.[A-Za-z]{2,24}')
 # Cost and abuse limits for a public instance (0 disables a rate limit)
 JOB_WORKERS = env_int('JOB_WORKERS', 2)
 MAX_PENDING_JOBS = env_int('MAX_PENDING_JOBS', 8)
+# Keep this below gunicorn's thread count so status polling still gets through
+MAX_CONCURRENT_ANSWERS = env_int('MAX_CONCURRENT_ANSWERS', 4)
 VIDEOS_PER_HOUR = env_int('RATE_LIMIT_VIDEOS_PER_HOUR', 10)
 QUESTIONS_PER_HOUR = env_int('RATE_LIMIT_QUESTIONS_PER_HOUR', 60)
 FEEDBACK_PER_DAY = env_int('RATE_LIMIT_FEEDBACK_PER_DAY', 10)
@@ -115,6 +120,11 @@ MAX_RECENT_ANSWERS = 1000
 job_pool = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix='job')
 jobs_lock = threading.Lock()
 pending_jobs = set()
+answer_slots = threading.BoundedSemaphore(max(1, MAX_CONCURRENT_ANSWERS))
+
+
+def set_status(video_id, status, **fields):
+    transcription_status[video_id] = {'status': status, **fields, 'updated': time.time()}
 
 
 class RateLimiter:
@@ -163,7 +173,7 @@ def submit_job(video_id, title, fn, *args):
         if len(pending_jobs) >= MAX_PENDING_JOBS:
             return False
         pending_jobs.add(video_id)
-        transcription_status[video_id] = {'status': 'queued', 'progress': 0, 'title': title}
+        set_status(video_id, 'queued', progress=0, title=title)
 
     def run():
         try:
@@ -173,35 +183,44 @@ def submit_job(video_id, title, fn, *args):
                 pending_jobs.discard(video_id)
 
     job_pool.submit(run)
-    cleanup_old_files()
     return True
 
 
-_last_cleanup = 0.0
-
-
-def cleanup_old_files():
-    """Delete videos and transcripts older than RETENTION_HOURS (checked every 10 minutes)."""
-    global _last_cleanup
-    now = time.time()
-    if RETENTION_HOURS <= 0 or now - _last_cleanup < 600:
-        return
-    _last_cleanup = now
+def cleanup_old_files(now=None):
+    """Delete videos, transcripts and job states older than RETENTION_HOURS."""
+    now = now or time.time()
     cutoff = now - RETENTION_HOURS * 3600
-    for folder in (UPLOAD_FOLDER, TRANSCRIPT_FOLDER, WORK_FOLDER):
-        for path in folder.iterdir():
-            try:
-                if path.stat().st_mtime >= cutoff:
-                    continue
-                if path.is_dir():
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    path.unlink()
+    # Holding jobs_lock keeps submit_job from starting a job on files we are deleting
+    with jobs_lock:
+        for folder in (UPLOAD_FOLDER, TRANSCRIPT_FOLDER, WORK_FOLDER):
+            for path in folder.iterdir():
                 video_id = path.name.split('.')[0]
-                transcription_store.pop(video_id, None)
+                try:
+                    if video_id in pending_jobs or path.stat().st_mtime >= cutoff:
+                        continue
+                    if path.is_dir():
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        path.unlink()
+                    transcription_store.pop(video_id, None)
+                except OSError:
+                    logger.warning(f"Could not remove {path}")
+        for video_id, status in list(transcription_status.items()):
+            if video_id not in pending_jobs and status.get('updated', now) < cutoff:
                 transcription_status.pop(video_id, None)
-            except OSError:
-                logger.warning(f"Could not remove {path}")
+
+
+def cleanup_loop():
+    while True:
+        time.sleep(600)
+        try:
+            cleanup_old_files()
+        except Exception:
+            logger.exception("Cleanup failed")
+
+
+if RETENTION_HOURS > 0:
+    threading.Thread(target=cleanup_loop, name='cleanup', daemon=True).start()
 
 
 def valid_video_id(video_id):
@@ -216,17 +235,24 @@ def load_transcript(video_id):
     """Return the transcript from memory or disk, or None."""
     if video_id in transcription_store:
         return transcription_store[video_id]
-    path = transcript_path(video_id)
-    if path.exists():
-        with open(path, 'r', encoding='utf-8') as f:
+    try:
+        with open(transcript_path(video_id), 'r', encoding='utf-8') as f:
             transcription_store[video_id] = json.load(f)
-        return transcription_store[video_id]
-    return None
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return transcription_store[video_id]
+
+
+def json_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
 
 
 @app.before_request
-def reject_cross_site_posts():
-    """The API is only meant to be called by our own page."""
+def check_request():
+    """Small bodies everywhere but the upload, and only our own page may POST."""
+    if request.path != '/api/upload':
+        request.max_content_length = MAX_JSON_BYTES
     if request.method != 'POST':
         return None
     site = request.headers.get('Sec-Fetch-Site')
@@ -262,20 +288,17 @@ def transcribe_audio(video_path, video_id, title=None):
     """Extract the audio track and transcribe it (runs in a background thread)."""
     wav_path = WORK_FOLDER / f"{video_id}.wav"
 
-    def set_status(progress):
-        transcription_status[video_id] = {'status': 'processing', 'progress': progress, 'title': title}
-
     def progress(fraction):
-        set_status(30 + int(fraction * 65))
+        set_status(video_id, 'processing', progress=30 + int(fraction * 65), title=title)
 
     try:
         logger.info(f"[TRANSCRIBE] Starting | video_id: {video_id}")
-        set_status(28)
+        set_status(video_id, 'processing', progress=28, title=title)
         media.extract_wav(video_path, wav_path, MAX_VIDEO_DURATION)
 
         if USE_LOCAL_WHISPER:
             model = f'whisper-{WHISPER_MODEL} (local)'
-            set_status(40)
+            set_status(video_id, 'processing', progress=40, title=title)
             segments = transcribe.transcribe_local(wav_path, WHISPER_MODEL, TRANSCRIBE_LANGUAGE)
         else:
             model = TRANSCRIBE_MODEL
@@ -296,15 +319,15 @@ def transcribe_audio(video_path, video_id, title=None):
         tmp.replace(transcript_path(video_id))
 
         transcription_store[video_id] = transcript_data
-        transcription_status[video_id] = {'status': 'completed', 'progress': 100}
+        set_status(video_id, 'completed', progress=100)
         logger.info(f"[TRANSCRIBE] Completed | video_id: {video_id} | model: {model} | segments: {len(segments)}")
 
     except media.MediaError as e:
         logger.info(f"[TRANSCRIBE] Rejected | video_id: {video_id} | {e}")
-        transcription_status[video_id] = {'status': 'error', 'error': str(e)}
+        set_status(video_id, 'error', error=str(e))
     except Exception:
         logger.exception(f"[TRANSCRIBE] Error | video_id: {video_id}")
-        transcription_status[video_id] = {'status': 'error', 'error': '음성을 텍스트로 바꾸지 못했어요.'}
+        set_status(video_id, 'error', error='음성을 텍스트로 바꾸지 못했어요.')
     finally:
         wav_path.unlink(missing_ok=True)
 
@@ -314,7 +337,7 @@ def process_youtube_job(youtube_id, video_id):
     workdir = WORK_FOLDER / video_id
 
     def progress(fraction):
-        transcription_status[video_id] = {'status': 'downloading', 'progress': int(fraction * 25)}
+        set_status(video_id, 'downloading', progress=int(fraction * 25))
 
     try:
         audio_path, info = media.download_youtube_audio(
@@ -323,10 +346,11 @@ def process_youtube_job(youtube_id, video_id):
         logger.info(f"[YOUTUBE] Downloaded audio | video_id: {video_id} | title: {info.get('title')!r}")
         transcribe_audio(audio_path, video_id, title=info.get('title'))
     except media.MediaError as e:
-        transcription_status[video_id] = {'status': 'error', 'error': str(e)}
+        logger.info(f"[YOUTUBE] Rejected | video_id: {video_id} | {e}")
+        set_status(video_id, 'error', error=str(e))
     except Exception:
         logger.exception(f"[YOUTUBE] Download error | video_id: {video_id}")
-        transcription_status[video_id] = {'status': 'error', 'error': 'YouTube 영상을 가져오지 못했어요.'}
+        set_status(video_id, 'error', error='YouTube 영상을 가져오지 못했어요.')
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -360,19 +384,20 @@ def serve_uploads(filename):
 @app.route('/api/upload', methods=['POST'])
 def upload_video():
     """Handle video file upload"""
-    if 'video' not in request.files:
-        return jsonify({'error': 'No video file provided'}), 400
-
-    file = request.files['video']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    if Path(file.filename).suffix.lower() not in media.UPLOAD_EXTENSIONS:
-        return jsonify({'error': 'unsupported', 'message': 'MP4 또는 WebM 영상만 올릴 수 있어요.'}), 400
+    # Checked before request.files, which reads the whole body
     if queue_full():
         return jsonify({'error': 'busy', 'message': '지금 처리 중인 영상이 많아요. 잠시 후 다시 시도해 주세요.'}), 503
     limited = rate_limited('videos', VIDEOS_PER_HOUR, 3600)
     if limited:
         return limited
+
+    if 'video' not in request.files:
+        return jsonify({'error': 'No video file provided'}), 400
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    if Path(file.filename).suffix.lower() not in media.UPLOAD_EXTENSIONS:
+        return jsonify({'error': 'unsupported', 'message': 'MP4 또는 WebM 영상만 올릴 수 있어요.'}), 400
 
     video_id = secrets.token_hex(16)
     tmp_path = WORK_FOLDER / f"{video_id}.upload"
@@ -406,7 +431,7 @@ def upload_video():
 @app.route('/api/youtube', methods=['POST'])
 def process_youtube():
     """Start transcribing a YouTube video (or reuse an earlier transcript)."""
-    data = request.get_json(silent=True) or {}
+    data = json_body()
     youtube_id = media.parse_youtube_url(data.get('url') if isinstance(data.get('url'), str) else '')
     if not youtube_id:
         return jsonify({'error': 'invalid_url',
@@ -488,7 +513,7 @@ def sse(payload):
 @app.route('/api/ask', methods=['POST'])
 def ask_question():
     """Answer a question about the lecture, streamed as server-sent events."""
-    data = request.get_json(silent=True) or {}
+    data = json_body()
     video_id = data.get('video_id')
     question = data.get('question')
     current_time = parse_time(data.get('current_time'))
@@ -507,6 +532,8 @@ def ask_question():
     prompt = qa.build_input(transcript['segments'], current_time, question,
                             history=parse_history(data.get('history')), title=transcript.get('title'))
 
+    if not answer_slots.acquire(blocking=False):
+        return jsonify({'error': 'busy', 'message': '지금 질문이 몰려 있어요. 잠시 후 다시 시도해 주세요.'}), 503
     answer_id = secrets.token_urlsafe(12)
 
     def generate():
@@ -528,7 +555,7 @@ def ask_question():
             logger.exception(f"[ASK] Error | video_id: {video_id}")
             yield sse({'error': '답변을 만들지 못했어요. 잠시 후 다시 시도해 주세요.'})
 
-    return Response(
+    response = Response(
         stream_with_context(generate()),
         mimetype='text/event-stream',
         headers={
@@ -536,6 +563,9 @@ def ask_question():
             'X-Accel-Buffering': 'no'
         }
     )
+    # Runs when the stream finishes or the client goes away
+    response.call_on_close(answer_slots.release)
+    return response
 
 
 @app.route('/api/feedback', methods=['POST'])
@@ -544,7 +574,7 @@ def send_feedback():
     if not FEEDBACK_ENABLED:
         return jsonify({'error': 'not_configured', 'message': '교수님께 메일 보내기가 설정되지 않았어요.'}), 503
 
-    data = request.get_json(silent=True) or {}
+    data = json_body()
     answer_id = data.get('answer_id')
     comment = str(data.get('comment') or '').strip()[:2000]
     reply_to = str(data.get('reply_to') or '').strip()
@@ -592,8 +622,10 @@ def send_feedback():
         email['reply_to'] = reply_to
 
     try:
+        # The idempotency key makes a retry after a lost response safe
         response = requests.post('https://api.resend.com/emails',
-                                 headers={'Authorization': f'Bearer {RESEND_API_KEY}'},
+                                 headers={'Authorization': f'Bearer {RESEND_API_KEY}',
+                                          'Idempotency-Key': f'lecture-qa-{answer_id}'},
                                  json=email, timeout=10)
         ok = response.status_code == 200
         if not ok:

@@ -8,6 +8,8 @@ venv/
 
 # Local config and secrets
 .env
+.env.*
+!.env.example
 cookies.txt
 docker-compose.override.yml
 

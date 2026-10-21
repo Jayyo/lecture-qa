@@ -81,7 +81,7 @@ def build_input(segments, at, question, history=(), title=None, max_chars=60000)
     return "\n".join(lines)
 
 
-def stream_answer(client, model, prompt, reasoning_effort=None, max_output_tokens=1000):
+def stream_answer(client, model, prompt, reasoning_effort=None, max_output_tokens=1000, timeout=60):
     """Yield text deltas of the answer."""
     kwargs = {
         'model': model,
@@ -89,12 +89,19 @@ def stream_answer(client, model, prompt, reasoning_effort=None, max_output_token
         'input': prompt,
         'max_output_tokens': max_output_tokens,
         'stream': True,
+        # Also bounds the wait between streamed chunks, so a stalled answer gives up
+        'timeout': timeout,
     }
     if reasoning_effort:
         kwargs['reasoning'] = {'effort': reasoning_effort}
 
-    for event in client.responses.create(**kwargs):
-        if event.type == 'response.output_text.delta':
-            yield event.delta
-        elif event.type in ('response.failed', 'error'):
-            raise RuntimeError(f"{event.type}: {getattr(event, 'response', None) or getattr(event, 'message', '')}")
+    # Leaving the with-block (also when the browser disconnects) closes the upstream stream
+    with client.responses.create(**kwargs) as stream:
+        for event in stream:
+            if event.type == 'response.output_text.delta':
+                yield event.delta
+            elif event.type == 'response.completed':
+                return
+            elif event.type in ('response.failed', 'response.incomplete', 'error'):
+                raise RuntimeError(f"{event.type}: {getattr(event, 'response', None) or getattr(event, 'message', '')}")
+    raise RuntimeError('stream ended before response.completed')

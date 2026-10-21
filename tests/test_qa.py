@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+import pytest
+
 from backend import qa
 
 SEGMENTS = [
@@ -43,3 +47,42 @@ def test_transcript_window_centers_on_the_pause():
     assert starts == sorted(starts)
     # leans towards what was already said
     assert sum(1 for t in starts if t < 500) > sum(1 for t in starts if t > 500)
+
+
+class FakeStream:
+    def __init__(self, events):
+        self.events = events
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+    def __iter__(self):
+        return iter(self.events)
+
+
+def fake_client(events):
+    stream = FakeStream([SimpleNamespace(**e) for e in events])
+    client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: stream))
+    return client, stream
+
+
+def test_stream_answer_yields_text_until_completed():
+    client, stream = fake_client([
+        {'type': 'response.output_text.delta', 'delta': 'Hel'},
+        {'type': 'response.output_text.delta', 'delta': 'lo'},
+        {'type': 'response.completed'},
+    ])
+    assert ''.join(qa.stream_answer(client, 'm', 'p')) == 'Hello'
+    assert stream.closed
+
+
+@pytest.mark.parametrize('last', [[{'type': 'response.incomplete'}], []])
+def test_stream_answer_fails_without_completion(last):
+    client, stream = fake_client([{'type': 'response.output_text.delta', 'delta': 'Hel'}] + last)
+    with pytest.raises(RuntimeError):
+        list(qa.stream_answer(client, 'm', 'p'))
+    assert stream.closed

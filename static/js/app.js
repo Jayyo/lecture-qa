@@ -29,6 +29,7 @@ const emptyTranscript = transcriptList.querySelector('.transcript-empty').cloneN
 
 let config = { max_minutes: 20, max_upload_mb: 300, feedback_enabled: false };
 let job = null;            // { id, kind: 'upload' | 'youtube', ... }
+let selection = 0;         // bumped whenever the user picks a video or starts over
 let segments = [];
 let history = [];          // last questions and answers, sent along for follow-ups
 let pollTimer = null;
@@ -142,15 +143,16 @@ function loadYouTubeApi() {
     return youtubeApi;
 }
 
-async function mountYouTube(youtubeId) {
+async function mountYouTube(forJob) {
     const YT = await loadYouTubeApi();
+    if (job !== forJob) return;  // the user moved on while the API loaded
     const target = document.createElement('div');
     ytMount.replaceChildren(target);
     ytMount.hidden = false;
     player.kind = 'youtube';
     player.yt = new YT.Player(target, {
         host: 'https://www.youtube-nocookie.com',
-        videoId: youtubeId,
+        videoId: forJob.youtubeId,
         playerVars: { rel: 0, playsinline: 1 },
         events: {
             onError: (event) => {
@@ -204,6 +206,7 @@ function uploadFile(file) {
         return;
     }
 
+    const mine = ++selection;
     openWorkspace(file.name);
     setStatus('영상을 올리는 중', 0);
 
@@ -217,6 +220,7 @@ function uploadFile(file) {
         if (event.lengthComputable) setStatus('영상을 올리는 중', Math.round((event.loaded / event.total) * 100));
     });
     xhr.addEventListener('load', () => {
+        if (mine !== selection) return;
         uploadRequest = null;
         const data = xhr.response || {};
         if (xhr.status !== 200) {
@@ -227,6 +231,7 @@ function uploadFile(file) {
         startJob({ id: data.video_id, kind: 'upload', mediaUrl: data.video_url });
     });
     xhr.addEventListener('error', () => {
+        if (mine !== selection) return;
         uploadRequest = null;
         resetToStart();
         showToast('업로드 중에 연결이 끊겼어요.', 'error');
@@ -241,10 +246,12 @@ youtubeForm.addEventListener('submit', async (event) => {
         showToast('YouTube 영상 주소를 입력해 주세요.', 'error');
         return;
     }
+    const mine = ++selection;
     loadYoutubeBtn.disabled = true;
     try {
         const response = await postJSON('/api/youtube', { url });
         const data = await response.json().catch(() => ({}));
+        if (mine !== selection) return;  // a file was picked meanwhile
         if (!response.ok) {
             showToast(data.message || '영상을 불러오지 못했어요.', 'error');
             return;
@@ -252,7 +259,7 @@ youtubeForm.addEventListener('submit', async (event) => {
         openWorkspace(data.title || 'YouTube 영상');
         startJob({ id: data.video_id, kind: 'youtube', youtubeId: data.youtube_id, ready: data.cached });
     } catch (error) {
-        showToast('영상을 불러오지 못했어요.', 'error');
+        if (mine === selection) showToast('영상을 불러오지 못했어요.', 'error');
     } finally {
         loadYoutubeBtn.disabled = false;
     }
@@ -261,10 +268,33 @@ youtubeForm.addEventListener('submit', async (event) => {
 // ---------------------------------------------------------------- job
 
 function openWorkspace(title) {
+    clearWorkspace();
     startSection.hidden = true;
     workspace.hidden = false;
     newVideoBtn.hidden = false;
     videoTitle.textContent = title;
+}
+
+// Forget everything that belonged to the previous video
+function clearWorkspace() {
+    clearTimeout(pollTimer);
+    if (askController) askController.abort();
+    askController = null;
+    job = null;
+    segments = [];
+    history = [];
+    activeIndex = -1;
+
+    player.destroy();
+    chatMessages.replaceChildren(welcomeMessage.cloneNode(true));
+    transcriptList.replaceChildren(emptyTranscript.cloneNode(true));
+    transcriptMeta.textContent = '';
+    videoTitle.textContent = '';
+    jobStatus.hidden = true;
+    chatInput.value = '';
+    chatInput.disabled = true;
+    sendBtn.disabled = true;
+    chatInput.placeholder = '자막을 만드는 중이에요...';
 }
 
 function setStatus(text, percent) {
@@ -289,13 +319,13 @@ function startJob(next) {
     if (job.kind === 'upload') {
         mountUpload(job.mediaUrl);
     } else {
-        mountYouTube(job.youtubeId).catch(() => showToast('YouTube 플레이어를 불러오지 못했어요.', 'error'));
+        mountYouTube(job).catch(() => showToast('YouTube 플레이어를 불러오지 못했어요.', 'error'));
     }
     if (job.ready) {
         loadTranscript();
     } else {
         setStatus('작업을 준비하는 중', 0);
-        pollStatus(job.id);
+        pollStatus(job);
     }
 }
 
@@ -306,19 +336,19 @@ function statusText(data) {
     return '음성을 자막으로 바꾸는 중';
 }
 
-function pollStatus(id) {
+function pollStatus(current) {
     let failures = 0;
     const tick = async () => {
-        if (!job || job.id !== id) return;
+        if (job !== current) return;
         let response = null;
         let data = null;
         try {
-            response = await fetch(`/api/status/${encodeURIComponent(id)}`);
+            response = await fetch(`/api/status/${encodeURIComponent(current.id)}`);
             data = await response.json();
         } catch (error) {
             data = null;
         }
-        if (!job || job.id !== id) return;
+        if (job !== current) return;
 
         if (response && response.status === 404) {
             failJob('작업을 찾을 수 없어요. 영상을 다시 열어 주세요.');
@@ -348,15 +378,15 @@ function pollStatus(id) {
 }
 
 async function loadTranscript() {
-    const id = job.id;
+    const current = job;
     let data = null;
     try {
-        const response = await fetch(`/api/transcript/${encodeURIComponent(id)}`);
+        const response = await fetch(`/api/transcript/${encodeURIComponent(current.id)}`);
         if (response.ok) data = await response.json();
     } catch (error) {
         data = null;
     }
-    if (!job || job.id !== id) return;
+    if (job !== current) return;
     if (!data) {
         failJob('자막을 불러오지 못했어요.');
         return;
@@ -454,13 +484,15 @@ function addMessage(sender, text, at) {
 // Answers cite moments like [03:12]; those become buttons that jump there.
 const TIMESTAMP_RE = /\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:\s*[-–~]\s*(?:\d{1,2}:)?\d{1,2}:\d{2})?\]/g;
 
+// The transcript shown to the model labels each line with its start time
+// rounded down, so [00:12] means the line that starts in 12.0-12.99 s.
 function segmentStartFor(seconds) {
     if (!segments.length) return null;
     const last = segments[segments.length - 1];
     if (seconds > Math.max(last.end || 0, last.start) + 1) return null;
     let start = segments[0].start;
     for (const segment of segments) {
-        if (segment.start > seconds + 0.5) break;
+        if (Math.floor(segment.start) > seconds) break;
         start = segment.start;
     }
     return start;
@@ -542,6 +574,7 @@ async function ask() {
         }
 
         let failure = null;
+        let finished = false;
         await readEventStream(response, (event) => {
             if (event.answer_id) answerId = event.answer_id;
             if (event.delta) {
@@ -550,8 +583,10 @@ async function ask() {
                 chatMessages.scrollTop = chatMessages.scrollHeight;
             }
             if (event.error) failure = event.error;
+            if (event.done) finished = true;
         });
         if (failure) throw new Error(failure);
+        if (!finished) throw new Error('답변이 중간에 끊겼어요. 다시 질문해 주세요.');
         if (!answer) throw new Error('빈 답변이 왔어요. 다시 질문해 주세요.');
 
         history.push({ question, answer });
@@ -654,26 +689,10 @@ function openFeedback(item, trigger) {
 // ---------------------------------------------------------------- reset
 
 function resetToStart() {
-    clearTimeout(pollTimer);
-    if (askController) askController.abort();
+    selection++;
     if (uploadRequest) uploadRequest.abort();
-    askController = null;
     uploadRequest = null;
-    job = null;
-    segments = [];
-    history = [];
-    activeIndex = -1;
-
-    player.destroy();
-    chatMessages.replaceChildren(welcomeMessage.cloneNode(true));
-    transcriptList.replaceChildren(emptyTranscript.cloneNode(true));
-    transcriptMeta.textContent = '';
-    videoTitle.textContent = '';
-    jobStatus.hidden = true;
-    chatInput.value = '';
-    chatInput.disabled = true;
-    sendBtn.disabled = true;
-    chatInput.placeholder = '자막을 만드는 중이에요...';
+    clearWorkspace();
 
     workspace.hidden = true;
     startSection.hidden = false;

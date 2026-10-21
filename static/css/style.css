@@ -558,6 +558,42 @@ input {
     margin-bottom: 14px;
 }
 
+.modal-preview {
+    background: var(--bg-page);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    font-size: 0.85rem;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+.preview-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.preview-question {
+    font-weight: 500;
+    margin-bottom: 4px;
+}
+
+.preview-answer {
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+}
+
+.modal-content .text-input {
+    width: 100%;
+}
+
+.link-btn:disabled {
+    color: var(--text-muted);
+    text-decoration: none;
+    cursor: default;
+}
+
 .modal-content textarea {
     width: 100%;
     min-height: 96px;

@@ -27,7 +27,7 @@ const sendBtn = $('sendBtn');
 const welcomeMessage = chatMessages.querySelector('.welcome-message').cloneNode(true);
 const emptyTranscript = transcriptList.querySelector('.transcript-empty').cloneNode(true);
 
-let config = { max_minutes: 20, max_upload_mb: 300 };
+let config = { max_minutes: 20, max_upload_mb: 300, feedback_enabled: false };
 let job = null;            // { id, kind: 'upload' | 'youtube', ... }
 let segments = [];
 let history = [];          // last questions and answers, sent along for follow-ups
@@ -500,12 +500,14 @@ function addAnswerActions(bubble, item) {
     resume.addEventListener('click', () => player.play());
     actions.appendChild(resume);
 
-    const feedback = document.createElement('button');
-    feedback.type = 'button';
-    feedback.className = 'link-btn';
-    feedback.textContent = '교수님께 질문 보내기';
-    feedback.addEventListener('click', () => openFeedback(item));
-    actions.appendChild(feedback);
+    if (config.feedback_enabled && item.answerId) {
+        const feedback = document.createElement('button');
+        feedback.type = 'button';
+        feedback.className = 'link-btn';
+        feedback.textContent = '교수님께 질문 보내기';
+        feedback.addEventListener('click', () => openFeedback(item, feedback));
+        actions.appendChild(feedback);
+    }
 
     bubble.parentElement.appendChild(actions);
 }
@@ -525,6 +527,7 @@ async function ask() {
     const controller = new AbortController();
     askController = controller;
     let answer = '';
+    let answerId = null;
     try {
         const response = await postJSON('/api/ask', {
             video_id: job.id,
@@ -539,6 +542,7 @@ async function ask() {
 
         let failure = null;
         await readEventStream(response, (event) => {
+            if (event.answer_id) answerId = event.answer_id;
             if (event.delta) {
                 answer += event.delta;
                 renderAnswer(bubble, answer);
@@ -550,7 +554,7 @@ async function ask() {
         if (!answer) throw new Error('빈 답변이 왔어요. 다시 질문해 주세요.');
 
         history.push({ question, answer });
-        addAnswerActions(bubble, { question, answer, at });
+        addAnswerActions(bubble, { answerId, question, answer, at });
     } catch (error) {
         if (error.name !== 'AbortError') bubble.textContent = error.message || '답변을 가져오지 못했어요.';
     } finally {
@@ -591,40 +595,52 @@ async function readEventStream(response, onEvent) {
 
 // ---------------------------------------------------------------- professor feedback
 
-function openFeedback(item) {
+function openFeedback(item, trigger) {
     const modal = document.createElement('div');
     modal.className = 'modal';
     modal.innerHTML = `
-        <div class="modal-content" role="dialog" aria-modal="true">
-            <h3>교수님께 질문 보내기</h3>
-            <p class="modal-hint">질문, AI 답변, 질문한 시점의 강의 내용이 함께 전달돼요.</p>
-            <textarea placeholder="AI 답변에서 부족했던 점이나 더 궁금한 점을 적어 주세요"></textarea>
+        <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="feedbackTitle">
+            <h3 id="feedbackTitle">교수님께 질문 보내기</h3>
+            <p class="modal-hint">아래 질문과 AI 답변, 질문한 시점까지의 강의 내용이 메일로 전달돼요.</p>
+            <div class="modal-preview">
+                <div class="preview-label"></div>
+                <p class="preview-question"></p>
+                <p class="preview-answer"></p>
+            </div>
+            <textarea maxlength="2000" placeholder="AI 답변에서 부족했던 점이나 더 궁금한 점 (선택)"></textarea>
+            <input type="email" class="text-input" maxlength="200" placeholder="답장 받을 이메일 (선택)">
             <div class="modal-buttons">
                 <button type="button" class="btn btn-ghost" data-action="cancel">취소</button>
                 <button type="button" class="btn btn-primary" data-action="send">보내기</button>
             </div>
         </div>
     `;
+    modal.querySelector('.preview-label').textContent = `${formatTime(item.at)}에 한 질문`;
+    modal.querySelector('.preview-question').textContent = item.question;
+    modal.querySelector('.preview-answer').textContent = item.answer;
     document.body.appendChild(modal);
+
     const textarea = modal.querySelector('textarea');
+    const emailInput = modal.querySelector('input[type="email"]');
     const sendButton = modal.querySelector('[data-action="send"]');
-    modal.querySelector('[data-action="cancel"]').addEventListener('click', () => modal.remove());
+    const close = () => modal.remove();
+    modal.querySelector('[data-action="cancel"]').addEventListener('click', close);
     modal.addEventListener('click', (event) => {
-        if (event.target === modal) modal.remove();
+        if (event.target === modal) close();
     });
     sendButton.addEventListener('click', async () => {
         sendButton.disabled = true;
         try {
             const response = await postJSON('/api/feedback', {
-                video_id: job.id,
-                question: item.question,
-                answer: item.answer,
-                current_time: item.at,
-                user_feedback: textarea.value.trim(),
+                answer_id: item.answerId,
+                comment: textarea.value.trim(),
+                reply_to: emailInput.value.trim(),
             });
             const data = await response.json().catch(() => ({}));
             if (!response.ok) throw new Error(data.message || '보내지 못했어요.');
-            modal.remove();
+            close();
+            trigger.disabled = true;
+            trigger.textContent = '교수님께 보냄';
             showToast('교수님께 보냈어요.', 'success');
         } catch (error) {
             sendButton.disabled = false;

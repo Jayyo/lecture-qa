@@ -7,6 +7,7 @@ import shutil
 import threading
 import logging
 import importlib.util
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -72,6 +73,14 @@ CHAT_MODEL = os.getenv('CHAT_MODEL', 'gpt-6.1-sol')
 CHAT_REASONING_EFFORT = os.getenv('CHAT_REASONING_EFFORT', 'low')
 CHAT_MAX_OUTPUT_TOKENS = env_int('CHAT_MAX_OUTPUT_TOKENS', 1000)
 
+# "Ask the professor" mails go out through Resend; the button only shows up
+# when all three are set. FEEDBACK_FROM must use a domain verified in Resend.
+PROFESSOR_EMAIL = os.getenv('PROFESSOR_EMAIL')
+RESEND_API_KEY = os.getenv('RESEND_API_KEY')
+FEEDBACK_FROM = os.getenv('FEEDBACK_FROM')
+FEEDBACK_ENABLED = bool(PROFESSOR_EMAIL and RESEND_API_KEY and FEEDBACK_FROM)
+EMAIL_RE = re.compile(r'[^@\s<>"]{1,64}@[^@\s<>"]{1,190}\.[A-Za-z]{2,24}')
+
 # Optional offline transcription with openai-whisper (tiny, base, small, medium, large)
 USE_LOCAL_WHISPER = os.getenv('USE_LOCAL_WHISPER', 'false').lower() == 'true'
 WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'small')
@@ -84,6 +93,12 @@ client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 # Store transcription status and content
 transcription_store = {}
 transcription_status = {}
+
+# Recent answers, so a mail to the professor quotes what the model really said
+# instead of whatever the browser sends.
+recent_answers = OrderedDict()
+answers_lock = threading.Lock()
+MAX_RECENT_ANSWERS = 1000
 
 
 def valid_video_id(video_id):
@@ -223,6 +238,7 @@ def get_config():
     return jsonify({
         'max_minutes': MAX_VIDEO_MINUTES,
         'max_upload_mb': MAX_UPLOAD_MB,
+        'feedback_enabled': FEEDBACK_ENABLED,
     })
 
 
@@ -372,10 +388,22 @@ def ask_question():
     prompt = qa.build_input(transcript['segments'], current_time, question,
                             history=parse_history(data.get('history')), title=transcript.get('title'))
 
+    answer_id = secrets.token_urlsafe(12)
+
     def generate():
+        parts = []
         try:
+            yield sse({'answer_id': answer_id})
             for delta in qa.stream_answer(client, CHAT_MODEL, prompt, CHAT_REASONING_EFFORT, CHAT_MAX_OUTPUT_TOKENS):
+                parts.append(delta)
                 yield sse({'delta': delta})
+            with answers_lock:
+                recent_answers[answer_id] = {
+                    'video_id': video_id, 'question': question, 'answer': ''.join(parts),
+                    'time': current_time, 'title': transcript.get('title'), 'sent': False,
+                }
+                while len(recent_answers) > MAX_RECENT_ANSWERS:
+                    recent_answers.popitem(last=False)
             yield sse({'done': True})
         except Exception:
             logger.exception(f"[ASK] Error | video_id: {video_id}")
@@ -393,60 +421,71 @@ def ask_question():
 
 @app.route('/api/feedback', methods=['POST'])
 def send_feedback():
-    """Send feedback email to professor"""
+    """Mail a question and the AI answer to the professor."""
+    if not FEEDBACK_ENABLED:
+        return jsonify({'error': 'not_configured', 'message': '교수님께 메일 보내기가 설정되지 않았어요.'}), 503
+
     data = request.get_json(silent=True) or {}
-    video_id = data.get('video_id')
-    question = str(data.get('question') or '')[:1000]
-    answer = str(data.get('answer') or '')[:3000]
-    current_time = parse_time(data.get('current_time'))
+    answer_id = data.get('answer_id')
+    comment = str(data.get('comment') or '').strip()[:2000]
+    reply_to = str(data.get('reply_to') or '').strip()
+    if reply_to and not EMAIL_RE.fullmatch(reply_to):
+        return jsonify({'error': 'bad_email', 'message': '이메일 주소를 확인해 주세요.'}), 400
 
-    professor_email = os.getenv('PROFESSOR_EMAIL')
-    resend_api_key = os.getenv('RESEND_API_KEY')
-    if not professor_email or not resend_api_key:
-        return jsonify({'error': 'not_configured', 'message': '교수님 메일 전송이 설정되지 않았어요.'}), 503
+    with answers_lock:
+        item = recent_answers.get(answer_id) if isinstance(answer_id, str) else None
+        if item is None:
+            return jsonify({'error': 'not_found', 'message': '답변을 찾을 수 없어요. 다시 질문한 뒤 보내 주세요.'}), 404
+        if item['sent']:
+            return jsonify({'error': 'already_sent', 'message': '이미 교수님께 보낸 질문이에요.'}), 409
+        item['sent'] = True
 
-    context = get_context_at_timestamp(video_id, current_time) if valid_video_id(video_id) else ''
-    timestamp_str = f"{int(current_time // 60)}:{int(current_time % 60):02d}"
+    when = qa.fmt_time(item['time'])
+    body = f"""교수님, 강의 영상 Q&A에서 학생이 AI 답변을 확인해 달라고 요청했습니다.
 
-    body = f"""안녕하세요 교수님,
+영상: {item['title'] or '(제목 없음)'}
+질문 시점: {when}
 
-학생이 강의 영상에서 질문을 했으나, AI 답변에 만족하지 못했습니다.
-확인 후 정확한 답변을 부탁드립니다.
+[학생 질문]
+{item['question']}
 
-질문 시점: {timestamp_str}
+[AI 답변]
+{item['answer']}
 
-해당 시점 강의 내용:
-{context[-500:]}
+[학생 의견]
+{comment or '(없음)'}
 
-학생 질문:
-{question}
+[질문 시점까지의 강의 내용 (자동 자막)]
+{get_context_at_timestamp(item['video_id'], item['time'])}
 
-AI 답변:
-{answer}
-
-강의 Q&A 시스템
+{'이 메일에 회신하면 학생에게 전달됩니다.' if reply_to else '학생이 연락처를 남기지 않았습니다.'}
 """
+    email = {
+        'from': FEEDBACK_FROM,
+        'to': [PROFESSOR_EMAIL],
+        'subject': f"[강의 Q&A] 학생 질문 확인 요청 ({when})",
+        'text': body,
+    }
+    if reply_to:
+        email['reply_to'] = reply_to
 
     try:
-        response = requests.post(
-            'https://api.resend.com/emails',
-            headers={'Authorization': f'Bearer {resend_api_key}'},
-            json={
-                'from': 'Lecture QA <onboarding@resend.dev>',
-                'to': [professor_email],
-                'subject': '[강의 Q&A] 학생 질문에 대한 답변 검토 요청',
-                'text': body
-            },
-            timeout=10
-        )
+        response = requests.post('https://api.resend.com/emails',
+                                 headers={'Authorization': f'Bearer {RESEND_API_KEY}'},
+                                 json=email, timeout=10)
+        ok = response.status_code == 200
+        if not ok:
+            logger.error(f"[FEEDBACK] Resend returned {response.status_code}: {response.text[:300]}")
     except requests.RequestException:
         logger.exception("[FEEDBACK] Resend request failed")
-        return jsonify({'error': 'send_failed', 'message': '메일을 보내지 못했어요.'}), 502
+        ok = False
 
-    if response.status_code == 200:
-        return jsonify({'message': 'Feedback sent to professor successfully'})
-    logger.error(f"[FEEDBACK] Resend returned {response.status_code}: {response.text[:300]}")
-    return jsonify({'error': 'send_failed', 'message': '메일을 보내지 못했어요.'}), 502
+    if not ok:
+        with answers_lock:
+            item['sent'] = False
+        return jsonify({'error': 'send_failed', 'message': '메일을 보내지 못했어요. 잠시 후 다시 시도해 주세요.'}), 502
+    logger.info(f"[FEEDBACK] Sent | answer_id: {answer_id}")
+    return jsonify({'message': 'sent'})
 
 
 if __name__ == '__main__':

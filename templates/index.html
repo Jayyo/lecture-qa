@@ -13,13 +13,7 @@
     <div class="container">
         <!-- Header -->
         <header class="header">
-            <div class="header-top">
-                <div class="header-spacer"></div>
-                <h1>실시간 강의 Q&A</h1>
-                <div class="user-menu" id="userMenu">
-                    <!-- Filled by JS -->
-                </div>
-            </div>
+            <h1>실시간 강의 Q&A</h1>
             <p class="subtitle">강의 영상을 업로드하고 AI와 대화하세요</p>
         </header>
 
@@ -35,7 +29,7 @@
                     <p class="upload-text">클릭하여 동영상 업로드</p>
                     <p class="upload-hint">또는 YouTube URL 입력</p>
                 </div>
-                <input type="file" id="videoInput" accept="video/*" style="position: absolute; left: -9999px; opacity: 0;">
+                <input type="file" id="videoInput" accept="video/mp4,video/webm,video/quicktime" class="visually-hidden">
             </label>
 
             <!-- YouTube URL Input -->
@@ -49,7 +43,7 @@
         </section>
 
         <!-- Video Section (hidden initially) -->
-        <section class="video-section" id="videoSection" style="display: none;">
+        <section class="video-section" id="videoSection" hidden>
             <div class="video-wrapper">
                 <!-- Video Container -->
                 <div class="video-container" id="videoContainer">

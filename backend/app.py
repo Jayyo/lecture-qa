@@ -1,23 +1,20 @@
 import os
 import json
-import subprocess
-import requests
+import math
 import re
-import hashlib
+import secrets
+import subprocess
 import threading
 import logging
-from datetime import datetime
-from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory, redirect, url_for, session
-from flask_cors import CORS
-from werkzeug.middleware.proxy_fix import ProxyFix
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from authlib.integrations.flask_client import OAuth
-from openai import OpenAI
-from dotenv import load_dotenv
 from pathlib import Path
+from urllib.parse import urlsplit
 
-# Configure logging
+import requests
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, Response, stream_with_context, send_from_directory
+from openai import OpenAI
+from werkzeug.middleware.proxy_fix import ProxyFix
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -28,63 +25,39 @@ logger = logging.getLogger(__name__)
 # Local Whisper support (optional)
 try:
     import whisper
-    import torch
     LOCAL_WHISPER_AVAILABLE = True
 except ImportError:
     LOCAL_WHISPER_AVAILABLE = False
 
-# Load .env from project root (one level up from backend/)
-env_path = Path(__file__).parent.parent / '.env'
-load_dotenv(dotenv_path=env_path, override=True)
+BASE_DIR = Path(__file__).resolve().parent.parent
+# Real environment variables win over .env
+load_dotenv(BASE_DIR / '.env')
 
-app = Flask(__name__, static_folder='../static', template_folder='../templates')
-app.secret_key = os.getenv('SECRET_KEY', os.urandom(24).hex())
 
-# Support reverse proxy (Caddy) - trust X-Forwarded-* headers
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+def env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
 
-CORS(app, supports_credentials=True)
 
-# Database configuration
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///../data/users.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+app = Flask(__name__, static_folder=str(BASE_DIR / 'static'), template_folder=str(BASE_DIR / 'templates'))
 
-# Login manager
-login_manager = LoginManager()
-login_manager.init_app(app)
+MAX_UPLOAD_MB = env_int('MAX_UPLOAD_MB', 300)
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 
-# OAuth setup
-oauth = OAuth(app)
-google = oauth.register(
-    name='google',
-    client_id=os.getenv('GOOGLE_CLIENT_ID'),
-    client_secret=os.getenv('GOOGLE_CLIENT_SECRET'),
-    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-    client_kwargs={'scope': 'openid email profile'}
-)
+# Only trust X-Forwarded-* when the app actually sits behind a proxy (Caddy in docker-compose)
+if os.getenv('TRUST_PROXY') == '1':
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-# User model
-class User(UserMixin, db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(100), unique=True, nullable=False)
-    name = db.Column(db.String(100))
-    profile_pic = db.Column(db.String(200))
-    provider = db.Column(db.String(50))  # 'google' or 'email'
+DATA_DIR = Path(os.getenv('DATA_DIR', BASE_DIR / 'data')).resolve()
+UPLOAD_FOLDER = DATA_DIR / 'uploads'
+TRANSCRIPT_FOLDER = DATA_DIR / 'transcripts'
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+TRANSCRIPT_FOLDER.mkdir(parents=True, exist_ok=True)
 
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
-
-# Create tables
-with app.app_context():
-    db.create_all()
-
-# Configuration
-UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'uploads')
-TRANSCRIPT_FOLDER = os.path.join(os.path.dirname(__file__), '..', 'transcripts')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(TRANSCRIPT_FOLDER, exist_ok=True)
+# Video ids are 32 hex chars; anything else never reaches the filesystem
+VIDEO_ID_RE = re.compile(r'^[0-9a-f]{32}$')
 
 # Maximum video duration in seconds (5 minutes)
 MAX_VIDEO_DURATION = 300
@@ -98,12 +71,12 @@ WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'small')
 # Load local Whisper model if enabled
 local_whisper_model = None
 if USE_LOCAL_WHISPER and LOCAL_WHISPER_AVAILABLE:
-    print(f"[Whisper] Loading local model: {WHISPER_MODEL}")
+    logger.info(f"[Whisper] Loading local model: {WHISPER_MODEL}")
     local_whisper_model = whisper.load_model(WHISPER_MODEL)
     device = next(local_whisper_model.parameters()).device
-    print(f"[Whisper] Model loaded on device: {device}")
+    logger.info(f"[Whisper] Model loaded on device: {device}")
 elif USE_LOCAL_WHISPER and not LOCAL_WHISPER_AVAILABLE:
-    print("[Whisper] Warning: USE_LOCAL_WHISPER=true but whisper not installed. Falling back to OpenAI API.")
+    logger.warning("[Whisper] USE_LOCAL_WHISPER=true but whisper not installed. Falling back to OpenAI API.")
     USE_LOCAL_WHISPER = False
 
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -112,13 +85,58 @@ client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 transcription_store = {}
 transcription_status = {}
 
-def get_request_info():
-    """Get request info for logging"""
-    return {
-        'ip': request.headers.get('X-Forwarded-For', request.remote_addr),
-        'user_agent': request.headers.get('User-Agent', 'Unknown')[:100],
-        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
+
+def valid_video_id(video_id):
+    return isinstance(video_id, str) and bool(VIDEO_ID_RE.match(video_id))
+
+
+def transcript_path(video_id):
+    return TRANSCRIPT_FOLDER / f"{video_id}.json"
+
+
+def load_transcript(video_id):
+    """Return the transcript from memory or disk, or None."""
+    if video_id in transcription_store:
+        return transcription_store[video_id]
+    path = transcript_path(video_id)
+    if path.exists():
+        with open(path, 'r', encoding='utf-8') as f:
+            transcription_store[video_id] = json.load(f)
+        return transcription_store[video_id]
+    return None
+
+
+@app.before_request
+def reject_cross_site_posts():
+    """The API is only meant to be called by our own page."""
+    if request.method != 'POST':
+        return None
+    site = request.headers.get('Sec-Fetch-Site')
+    if site and site not in ('same-origin', 'none'):
+        return jsonify({'error': 'cross_site', 'message': '허용되지 않은 요청이에요.'}), 403
+    origin = request.headers.get('Origin')
+    if origin and urlsplit(origin).netloc != request.host:
+        return jsonify({'error': 'cross_site', 'message': '허용되지 않은 요청이에요.'}), 403
+    return None
+
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    response.headers.setdefault(
+        'Content-Security-Policy',
+        "default-src 'self'; style-src 'self' https://fonts.googleapis.com; "
+        "font-src https://fonts.gstatic.com; img-src 'self' data:; media-src 'self'; "
+        "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    )
+    return response
+
+
+@app.errorhandler(413)
+def too_large(_):
+    return jsonify({'error': 'too_large', 'message': f'{MAX_UPLOAD_MB}MB 이하의 파일만 올릴 수 있어요.'}), 413
+
 
 def is_valid_youtube_video_url(url):
     """
@@ -154,14 +172,15 @@ def is_valid_youtube_video_url(url):
 
     return False, '올바른 YouTube 영상 URL을 입력해주세요.'
 
+
 def get_video_hash(video_path_or_url):
-    """Generate a hash for video identification"""
+    """Generate a stable id for a YouTube URL"""
+    import hashlib
     return hashlib.md5(video_path_or_url.encode()).hexdigest()
+
 
 def transcribe_with_local_whisper(audio_path, video_id):
     """Transcribe using local Whisper model"""
-    global local_whisper_model
-
     transcription_status[video_id] = {'status': 'processing', 'progress': 50, 'message': 'Transcribing with local Whisper...'}
 
     result = local_whisper_model.transcribe(
@@ -187,15 +206,15 @@ def transcribe_with_local_whisper(audio_path, video_id):
         'segments': segments
     }
 
+
 # OpenAI Whisper API file size limit (25MB)
 OPENAI_FILE_SIZE_LIMIT = 25 * 1024 * 1024  # 25MB in bytes
 # Chunk duration in seconds (2 minutes for safe margin)
 CHUNK_DURATION_SECONDS = 120
 
+
 def split_audio_into_chunks(audio_path, video_id):
     """Split large audio file into smaller chunks using ffmpeg"""
-    import glob
-
     # Get audio duration
     result = subprocess.run([
         'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
@@ -216,7 +235,7 @@ def split_audio_into_chunks(audio_path, video_id):
 
         # Extract chunk with ffmpeg
         subprocess.run([
-            'ffmpeg', '-i', audio_path,
+            'ffmpeg', '-nostdin', '-i', audio_path,
             '-ss', str(start_time),
             '-t', str(CHUNK_DURATION_SECONDS),
             '-acodec', 'libmp3lame', '-q:a', '4',
@@ -229,6 +248,7 @@ def split_audio_into_chunks(audio_path, video_id):
         })
 
     return chunk_paths
+
 
 def transcribe_with_openai_api(audio_path, video_id):
     """Transcribe using OpenAI Whisper API with chunking for large files"""
@@ -266,7 +286,7 @@ def transcribe_with_openai_api(audio_path, video_id):
         }
 
     # Large file - split into chunks and transcribe each
-    print(f"[Whisper] Large file detected ({file_size / 1024 / 1024:.1f}MB), splitting into chunks...")
+    logger.info(f"[Whisper] Large file detected ({file_size / 1024 / 1024:.1f}MB), splitting into chunks...")
     transcription_status[video_id] = {'status': 'processing', 'progress': 40, 'message': 'Splitting audio into chunks...'}
 
     try:
@@ -284,8 +304,6 @@ def transcribe_with_openai_api(audio_path, video_id):
                 'progress': progress,
                 'message': f'Transcribing chunk {i+1}/{len(chunks)}...'
             }
-
-            print(f"[Whisper] Transcribing chunk {i+1}/{len(chunks)}...")
 
             with open(chunk_path, 'rb') as audio_file:
                 transcript = client.audio.transcriptions.create(
@@ -318,66 +336,52 @@ def transcribe_with_openai_api(audio_path, video_id):
             'segments': all_segments
         }
 
-    except Exception as e:
+    except Exception:
         # Cleanup any remaining chunk files
         import glob
         base_path = audio_path.rsplit('.', 1)[0]
         for chunk_file in glob.glob(f"{base_path}_chunk*.mp3"):
             try:
                 os.remove(chunk_file)
-            except:
+            except OSError:
                 pass
-        raise e
+        raise
+
 
 def transcribe_audio(video_path, video_id):
     """Transcribe video audio using local Whisper or OpenAI API"""
+    audio_path = str(UPLOAD_FOLDER / f"{video_id}.mp3")
     try:
-        logger.info(f"[TRANSCRIBE] Starting | video_id: {video_id} | video_path: {video_path}")
-        transcription_status[video_id] = {'status': 'processing', 'progress': 30}
-
-        # Extract audio from video using ffmpeg
-        audio_path = os.path.join(UPLOAD_FOLDER, f"{video_id}.mp3")
-
+        logger.info(f"[TRANSCRIBE] Starting | video_id: {video_id}")
         transcription_status[video_id] = {'status': 'processing', 'progress': 35, 'message': 'Extracting audio...'}
-        logger.info(f"[TRANSCRIBE] Extracting audio | video_id: {video_id}")
 
-        # Extract audio
         subprocess.run([
-            'ffmpeg', '-i', video_path, '-vn', '-acodec', 'libmp3lame',
+            'ffmpeg', '-nostdin', '-i', str(video_path), '-vn', '-acodec', 'libmp3lame',
             '-q:a', '4', '-y', audio_path
         ], check=True, capture_output=True)
 
-        # Get audio file size for logging
         audio_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
         logger.info(f"[TRANSCRIBE] Audio extracted | video_id: {video_id} | size: {audio_size/1024/1024:.2f}MB")
 
-        # Choose transcription method
         if USE_LOCAL_WHISPER and local_whisper_model is not None:
-            logger.info(f"[TRANSCRIBE] Using local Whisper | video_id: {video_id}")
             transcript_data = transcribe_with_local_whisper(audio_path, video_id)
         else:
-            logger.info(f"[TRANSCRIBE] Using OpenAI API | video_id: {video_id}")
             transcript_data = transcribe_with_openai_api(audio_path, video_id)
 
-        # Save transcript
-        transcript_path = os.path.join(TRANSCRIPT_FOLDER, f"{video_id}.json")
-        with open(transcript_path, 'w', encoding='utf-8') as f:
+        with open(transcript_path(video_id), 'w', encoding='utf-8') as f:
             json.dump(transcript_data, f, ensure_ascii=False, indent=2)
 
         transcription_store[video_id] = transcript_data
         transcription_status[video_id] = {'status': 'completed', 'progress': 100}
-
         logger.info(f"[TRANSCRIBE] Completed | video_id: {video_id} | segments: {len(transcript_data.get('segments', []))}")
 
-        # Cleanup audio file
+    except Exception:
+        logger.exception(f"[TRANSCRIBE] Error | video_id: {video_id}")
+        transcription_status[video_id] = {'status': 'error', 'error': '음성을 텍스트로 바꾸지 못했어요.'}
+    finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
-    except Exception as e:
-        transcription_status[video_id] = {'status': 'error', 'error': str(e)}
-        logger.error(f"[TRANSCRIBE] Error | video_id: {video_id} | error: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
 
 def get_video_duration(url, yt_dlp_path='yt-dlp'):
     """Get video duration in seconds using yt-dlp"""
@@ -398,23 +402,18 @@ def get_video_duration(url, yt_dlp_path='yt-dlp'):
                 return int(parts[0])
         return None
     except Exception as e:
-        print(f"Duration check error: {e}")
+        logger.warning(f"Duration check error: {e}")
         return None
+
 
 def download_youtube_video(url, video_id, yt_dlp_path='yt-dlp'):
     """Download YouTube video using yt-dlp with progress tracking"""
-    output_path = os.path.join(UPLOAD_FOLDER, f"{video_id}.mp4")
+    output_path = UPLOAD_FOLDER / f"{video_id}.mp4"
 
     # Cookie file path for YouTube authentication (to bypass bot detection)
-    cookies_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'cookies.txt')
+    cookies_file = BASE_DIR / 'cookies.txt'
 
     try:
-        print(f"[DEBUG] Starting download for {video_id}")
-        print(f"[DEBUG] URL: {url}")
-        print(f"[DEBUG] Output path: {output_path}")
-        print(f"[DEBUG] Cookies file: {cookies_file}, exists: {os.path.exists(cookies_file)}")
-
-        # Build yt-dlp command with cookies if available
         cmd = [
             yt_dlp_path, '--no-playlist',
             '-f', 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
@@ -422,169 +421,72 @@ def download_youtube_video(url, video_id, yt_dlp_path='yt-dlp'):
             '--merge-output-format', 'mp4',
         ]
 
-        # Add cookies file if it exists
-        if os.path.exists(cookies_file):
-            cmd.extend(['--cookies', cookies_file])
-            print(f"[DEBUG] Using cookies file for authentication")
+        if cookies_file.exists():
+            cmd.extend(['--cookies', str(cookies_file)])
 
-        cmd.extend(['-o', output_path, url])
+        cmd.extend(['-o', str(output_path), url])
 
-        # Use yt-dlp with progress output and better format selection
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
 
         for line in process.stdout:
             line = line.strip()
-            print(f"[DEBUG] yt-dlp: {line}")
             # Parse download progress from yt-dlp output
             if '[download]' in line and '%' in line:
-                try:
-                    match = re.search(r'(\d+\.?\d*)%', line)
-                    if match:
-                        percent = float(match.group(1))
-                        # Scale download progress to 0-25% of total
-                        scaled_progress = int(percent * 0.25)
-                        transcription_status[video_id] = {
-                            'status': 'downloading',
-                            'progress': scaled_progress
-                        }
-                        print(f"[DEBUG] Progress: {scaled_progress}%")
-                except Exception as parse_err:
-                    print(f"[DEBUG] Parse error: {parse_err}")
+                match = re.search(r'(\d+\.?\d*)%', line)
+                if match:
+                    # Scale download progress to 0-25% of total
+                    transcription_status[video_id] = {
+                        'status': 'downloading',
+                        'progress': int(float(match.group(1)) * 0.25)
+                    }
 
         process.wait()
-        print(f"[DEBUG] Process finished with return code: {process.returncode}")
 
         if process.returncode == 0:
             transcription_status[video_id] = {'status': 'downloading', 'progress': 25}
-            print(f"[DEBUG] Download successful, file exists: {os.path.exists(output_path)}")
             return output_path
-        else:
-            print(f"[DEBUG] Download failed with return code: {process.returncode}")
-            return None
-    except Exception as e:
-        print(f"[DEBUG] Download error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.warning(f"[YOUTUBE] yt-dlp exited with {process.returncode} | video_id: {video_id}")
         return None
+    except Exception:
+        logger.exception(f"[YOUTUBE] Download error | video_id: {video_id}")
+        return None
+
 
 @app.route('/')
 def index():
-    # Check if user has visited before or is logged in
-    if current_user.is_authenticated or session.get('guest_access'):
-        return send_from_directory('../templates', 'index.html')
-    # First time visitor - redirect to login
-    return redirect('/login')
+    return send_from_directory(app.template_folder, 'index.html')
 
-@app.route('/login')
-def login_page():
-    # If already logged in or guest, redirect to main
-    if current_user.is_authenticated or session.get('guest_access'):
-        return redirect('/')
-    return send_from_directory('../templates', 'login.html')
 
-@app.route('/guest')
-def guest_access():
-    session['guest_access'] = True
-    return redirect('/')
-
-# Auth routes
-@app.route('/auth/google')
-def google_login():
-    redirect_uri = url_for('google_callback', _external=True)
-    return google.authorize_redirect(redirect_uri)
-
-@app.route('/auth/google/callback')
-def google_callback():
-    try:
-        token = google.authorize_access_token()
-        user_info = token.get('userinfo')
-
-        if not user_info:
-            app.logger.error("No userinfo in token")
-            return redirect('/login?error=failed')
-
-        # Find or create user
-        user = User.query.filter_by(email=user_info['email']).first()
-        if not user:
-            user = User(
-                email=user_info['email'],
-                name=user_info.get('name', ''),
-                profile_pic=user_info.get('picture', ''),
-                provider='google'
-            )
-            db.session.add(user)
-            db.session.commit()
-
-        login_user(user)
-        return redirect('/')
-    except Exception as e:
-        import traceback
-        app.logger.error(f"Google auth error: {e}")
-        app.logger.error(traceback.format_exc())
-        return redirect('/login?error=failed')
-
-@app.route('/auth/logout')
-def logout():
-    logout_user()
-    return redirect('/')
-
-@app.route('/api/user')
-def get_current_user():
-    if current_user.is_authenticated:
-        return jsonify({
-            'logged_in': True,
-            'id': current_user.id,
-            'email': current_user.email,
-            'name': current_user.name,
-            'profile_pic': current_user.profile_pic
-        })
-    return jsonify({'logged_in': False})
-
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    return send_from_directory('../static', filename)
-
-@app.route('/uploads/<path:filename>')
+@app.route('/uploads/<filename>')
 def serve_uploads(filename):
-    return send_from_directory('../uploads', filename)
+    video_id, _, ext = filename.partition('.')
+    if ext != 'mp4' or not valid_video_id(video_id):
+        return jsonify({'error': 'Not found'}), 404
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
 
 @app.route('/api/upload', methods=['POST'])
 def upload_video():
     """Handle video file upload"""
-    req_info = get_request_info()
-
     if 'video' not in request.files:
-        logger.warning(f"[UPLOAD] No video file | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
         return jsonify({'error': 'No video file provided'}), 400
 
     file = request.files['video']
     if file.filename == '':
-        logger.warning(f"[UPLOAD] Empty filename | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
         return jsonify({'error': 'No selected file'}), 400
 
-    # Get file size
-    file.seek(0, 2)  # Seek to end
-    file_size = file.tell()
-    file.seek(0)  # Seek back to start
-
-    video_id = get_video_hash(file.filename + str(os.urandom(8)))
+    video_id = secrets.token_hex(16)
     filename = f"{video_id}.mp4"
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-
-    logger.info(f"[UPLOAD] Started | video_id: {video_id} | filename: {file.filename} | size: {file_size/1024/1024:.2f}MB | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
-
+    filepath = UPLOAD_FOLDER / filename
     file.save(filepath)
 
-    logger.info(f"[UPLOAD] File saved | video_id: {video_id} | path: {filepath}")
+    logger.info(f"[UPLOAD] Saved | video_id: {video_id} | size: {filepath.stat().st_size/1024/1024:.2f}MB | IP: {request.remote_addr}")
 
     # Start transcription in background
     transcription_status[video_id] = {'status': 'processing', 'progress': 10}
-    thread = threading.Thread(target=transcribe_audio, args=(filepath, video_id))
-    thread.start()
-
-    logger.info(f"[UPLOAD] Transcription started | video_id: {video_id}")
+    threading.Thread(target=transcribe_audio, args=(filepath, video_id), daemon=True).start()
 
     return jsonify({
         'video_id': video_id,
@@ -592,37 +494,30 @@ def upload_video():
         'message': 'Video uploaded, transcription started'
     })
 
+
 @app.route('/api/youtube', methods=['POST'])
 def process_youtube():
     """Process YouTube URL"""
-    req_info = get_request_info()
-    data = request.json
+    data = request.get_json(silent=True) or {}
     url = data.get('url')
 
-    if not url:
-        logger.warning(f"[YOUTUBE] No URL provided | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
+    if not isinstance(url, str) or not url.strip():
         return jsonify({'error': 'No URL provided'}), 400
+    url = url.strip()
 
-    logger.info(f"[YOUTUBE] Request | URL: {url} | IP: {req_info['ip']} | UA: {req_info['user_agent']}")
+    logger.info(f"[YOUTUBE] Request | URL: {url} | IP: {request.remote_addr}")
 
     # Validate YouTube URL (reject channels, playlists, etc.)
     is_valid, error_msg = is_valid_youtube_video_url(url)
     if not is_valid:
-        logger.warning(f"[YOUTUBE] Invalid URL rejected | URL: {url} | Reason: {error_msg} | IP: {req_info['ip']}")
         return jsonify({'error': 'invalid_url', 'message': error_msg}), 400
 
     video_id = get_video_hash(url)
 
     # Check if already transcribed
-    transcript_path = os.path.join(TRANSCRIPT_FOLDER, f"{video_id}.json")
-    if os.path.exists(transcript_path):
-        logger.info(f"[YOUTUBE] Cache hit | video_id: {video_id} | URL: {url}")
-        with open(transcript_path, 'r', encoding='utf-8') as f:
-            transcription_store[video_id] = json.load(f)
+    if load_transcript(video_id) is not None:
         transcription_status[video_id] = {'status': 'completed', 'progress': 100}
-
-        video_path = os.path.join(UPLOAD_FOLDER, f"{video_id}.mp4")
-        if os.path.exists(video_path):
+        if (UPLOAD_FOLDER / f"{video_id}.mp4").exists():
             return jsonify({
                 'video_id': video_id,
                 'video_url': f'/uploads/{video_id}.mp4',
@@ -633,29 +528,23 @@ def process_youtube():
     # Check video duration before downloading
     duration = get_video_duration(url)
     if duration and duration > MAX_VIDEO_DURATION:
-        logger.warning(f"[YOUTUBE] Duration exceeded | URL: {url} | duration: {duration}s | IP: {req_info['ip']}")
         return jsonify({
             'error': 'duration_exceeded',
             'message': '5분 이하의 동영상만 불러올 수 있습니다.',
             'duration': duration
         }), 400
 
-    logger.info(f"[YOUTUBE] Starting download | video_id: {video_id} | URL: {url} | duration: {duration}s")
-
+    logger.info(f"[YOUTUBE] Starting download | video_id: {video_id} | duration: {duration}s")
     transcription_status[video_id] = {'status': 'downloading', 'progress': 0}
 
-    # Download and transcribe in background
     def process():
         video_path = download_youtube_video(url, video_id)
         if video_path:
-            logger.info(f"[YOUTUBE] Download complete | video_id: {video_id}")
             transcribe_audio(video_path, video_id)
         else:
-            logger.error(f"[YOUTUBE] Download failed | video_id: {video_id} | URL: {url}")
-            transcription_status[video_id] = {'status': 'error', 'error': 'Failed to download video'}
+            transcription_status[video_id] = {'status': 'error', 'error': '영상을 다운로드하지 못했어요.'}
 
-    thread = threading.Thread(target=process)
-    thread.start()
+    threading.Thread(target=process, daemon=True).start()
 
     return jsonify({
         'video_id': video_id,
@@ -663,39 +552,37 @@ def process_youtube():
         'message': 'Download and transcription started'
     })
 
+
 @app.route('/api/status/<video_id>')
 def get_status(video_id):
     """Get transcription status"""
-    status = transcription_status.get(video_id, {'status': 'unknown'})
+    if not valid_video_id(video_id):
+        return jsonify({'status': 'unknown'}), 404
+    status = transcription_status.get(video_id)
+    if status is None:
+        if load_transcript(video_id) is not None:
+            return jsonify({'status': 'completed', 'progress': 100})
+        return jsonify({'status': 'unknown'}), 404
     return jsonify(status)
+
 
 @app.route('/api/transcript/<video_id>')
 def get_transcript(video_id):
     """Get transcript for a video"""
-    if video_id in transcription_store:
-        return jsonify(transcription_store[video_id])
+    data = load_transcript(video_id) if valid_video_id(video_id) else None
+    if data is None:
+        return jsonify({'error': 'Transcript not found'}), 404
+    return jsonify(data)
 
-    transcript_path = os.path.join(TRANSCRIPT_FOLDER, f"{video_id}.json")
-    if os.path.exists(transcript_path):
-        with open(transcript_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            transcription_store[video_id] = data
-            return jsonify(data)
-
-    return jsonify({'error': 'Transcript not found'}), 404
 
 def get_context_at_timestamp(video_id, current_time):
     """Get transcript context around current timestamp"""
-    if video_id not in transcription_store:
+    data = load_transcript(video_id)
+    if not data:
         return ""
 
-    segments = transcription_store[video_id].get('segments', [])
-
-    # Get segments before current time (context)
-    context_segments = []
-    for seg in segments:
-        if seg['end'] <= current_time + 10:  # Include current and a bit ahead
-            context_segments.append(seg['text'])
+    # Segments heard so far, plus the one playing right now
+    context_segments = [seg['text'] for seg in data.get('segments', []) if seg['start'] <= current_time + 10]
 
     # Return last ~2000 chars of context
     context = ' '.join(context_segments)
@@ -704,32 +591,34 @@ def get_context_at_timestamp(video_id, current_time):
 
     return context
 
+
+def parse_time(value):
+    try:
+        t = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return t if math.isfinite(t) and t >= 0 else 0.0
+
+
 @app.route('/api/ask', methods=['POST'])
 def ask_question():
     """Answer question about video content - streaming response"""
-    data = request.json
+    data = request.get_json(silent=True) or {}
     video_id = data.get('video_id')
     question = data.get('question')
-    current_time = data.get('current_time', 0)
+    current_time = parse_time(data.get('current_time'))
 
-    if not video_id or not question:
+    if not valid_video_id(video_id) or not isinstance(question, str) or not question.strip():
         return jsonify({'error': 'Missing video_id or question'}), 400
+    question = question.strip()[:1000]
 
-    # Load transcript from file if not in memory
-    if video_id not in transcription_store:
-        transcript_path = os.path.join(TRANSCRIPT_FOLDER, f"{video_id}.json")
-        if os.path.exists(transcript_path):
-            with open(transcript_path, 'r', encoding='utf-8') as f:
-                transcription_store[video_id] = json.load(f)
-
-    # Get context from transcript
-    context = get_context_at_timestamp(video_id, current_time)
-    full_transcript = transcription_store.get(video_id, {}).get('full_text', '')
-
-    if not context and not full_transcript:
+    transcript = load_transcript(video_id)
+    if transcript is None:
         return jsonify({'error': 'Transcript not available'}), 404
 
-    # Build prompt
+    context = get_context_at_timestamp(video_id, current_time)
+    full_transcript = transcript.get('full_text', '')
+
     system_prompt = """너는 이 강의를 진행하는 선생님이야. 학생이 강의 중에 손을 들고 질문한 거라고 생각해.
 
 답변 규칙:
@@ -764,13 +653,14 @@ def ask_question():
             )
 
             for chunk in response:
-                if chunk.choices[0].delta.content:
+                if chunk.choices and chunk.choices[0].delta.content:
                     yield f"data: {json.dumps({'content': chunk.choices[0].delta.content})}\n\n"
 
             yield f"data: {json.dumps({'done': True})}\n\n"
 
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except Exception:
+            logger.exception(f"[ASK] Error | video_id: {video_id}")
+            yield f"data: {json.dumps({'error': '답변을 만들지 못했어요. 잠시 후 다시 시도해 주세요.'})}\n\n"
 
     return Response(
         stream_with_context(generate()),
@@ -781,107 +671,68 @@ def ask_question():
         }
     )
 
+
 @app.route('/api/feedback', methods=['POST'])
 def send_feedback():
     """Send feedback email to professor"""
-    data = request.json
+    data = request.get_json(silent=True) or {}
     video_id = data.get('video_id')
-    question = data.get('question')
-    answer = data.get('answer')
-    current_time = data.get('current_time', 0)
-    feedback_type = data.get('feedback_type', 'negative')
+    question = str(data.get('question') or '')[:1000]
+    answer = str(data.get('answer') or '')[:3000]
+    current_time = parse_time(data.get('current_time'))
 
-    if feedback_type != 'negative':
-        return jsonify({'message': 'Positive feedback recorded'}), 200
-
-    # Get logged-in user info
-    student_name = "익명 학생"
-    student_email = None
-    if current_user.is_authenticated:
-        student_name = current_user.name or current_user.email.split('@')[0]
-        student_email = current_user.email
-
-    # Get context
-    context = get_context_at_timestamp(video_id, current_time)
-
-    # Prepare email
-    professor_email = os.getenv('PROFESSOR_EMAIL', 'professor@example.com')
-
+    professor_email = os.getenv('PROFESSOR_EMAIL')
     resend_api_key = os.getenv('RESEND_API_KEY')
+    if not professor_email or not resend_api_key:
+        return jsonify({'error': 'not_configured', 'message': '교수님 메일 전송이 설정되지 않았어요.'}), 503
 
-    if not resend_api_key:
-        return jsonify({'error': 'Email not configured', 'message': 'RESEND_API_KEY not set'}), 500
-
-    # Format timestamp
-    minutes = int(current_time // 60)
-    seconds = int(current_time % 60)
-    timestamp_str = f"{minutes}:{seconds:02d}"
-
-    # Include student info in subject if logged in
-    if student_email:
-        subject = f"[강의 Q&A] {student_name} 학생의 질문 - 답변 검토 요청"
-    else:
-        subject = f"[강의 Q&A] 학생 질문에 대한 답변 검토 요청"
-
-    # Build student info section
-    student_info = f"👤 학생: {student_name}"
-    if student_email:
-        student_info += f" ({student_email})"
+    context = get_context_at_timestamp(video_id, current_time) if valid_video_id(video_id) else ''
+    timestamp_str = f"{int(current_time // 60)}:{int(current_time % 60):02d}"
 
     body = f"""안녕하세요 교수님,
 
 학생이 강의 영상에서 질문을 했으나, AI 답변에 만족하지 못했습니다.
 확인 후 정확한 답변을 부탁드립니다.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+질문 시점: {timestamp_str}
 
-{student_info}
+해당 시점 강의 내용:
+{context[-500:]}
 
-📍 질문 시점: {timestamp_str}
-
-📝 해당 시점 강의 내용:
-{context[:500]}...
-
-❓ 학생 질문:
+학생 질문:
 {question}
 
-🤖 AI 답변 (학생이 불만족):
+AI 답변:
 {answer}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-감사합니다.
 강의 Q&A 시스템
 """
 
     try:
-        email_data = {
-            'from': 'Lecture QA <onboarding@resend.dev>',
-            'to': [professor_email],
-            'subject': subject,
-            'text': body
-        }
-
-        # Add reply_to if student is logged in (so professor can reply directly)
-        if student_email:
-            email_data['reply_to'] = student_email
-
         response = requests.post(
             'https://api.resend.com/emails',
-            headers={
-                'Authorization': f'Bearer {resend_api_key}',
-                'Content-Type': 'application/json'
+            headers={'Authorization': f'Bearer {resend_api_key}'},
+            json={
+                'from': 'Lecture QA <onboarding@resend.dev>',
+                'to': [professor_email],
+                'subject': '[강의 Q&A] 학생 질문에 대한 답변 검토 요청',
+                'text': body
             },
-            json=email_data
+            timeout=10
         )
+    except requests.RequestException:
+        logger.exception("[FEEDBACK] Resend request failed")
+        return jsonify({'error': 'send_failed', 'message': '메일을 보내지 못했어요.'}), 502
 
-        if response.status_code == 200:
-            return jsonify({'message': 'Feedback sent to professor successfully'})
-        else:
-            return jsonify({'error': response.json()}), 500
+    if response.status_code == 200:
+        return jsonify({'message': 'Feedback sent to professor successfully'})
+    logger.error(f"[FEEDBACK] Resend returned {response.status_code}: {response.text[:300]}")
+    return jsonify({'error': 'send_failed', 'message': '메일을 보내지 못했어요.'}), 502
 
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(
+        host=os.getenv('HOST', '127.0.0.1'),
+        port=env_int('PORT', 5000),
+        debug=os.getenv('FLASK_DEBUG') == '1'
+    )

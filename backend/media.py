@@ -3,12 +3,16 @@
 Everything that hands user input to an external tool goes through here, so
 the checks live in one place.
 """
+import array
+import io
 import json
 import logging
 import math
 import re
 import shutil
 import subprocess
+import sys
+import wave
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -20,6 +24,9 @@ logger = logging.getLogger(__name__)
 DEMUXERS = {'mov': '.mp4', 'matroska': '.webm'}
 UPLOAD_EXTENSIONS = {'.mp4', '.m4v', '.mov', '.webm'}
 _LOCKDOWN = ['-protocol_whitelist', 'file', '-format_whitelist', ','.join(DEMUXERS)]
+
+SAMPLE_RATE = 16000
+FRAME_SECONDS = 0.05
 
 
 class MediaError(Exception):
@@ -54,18 +61,88 @@ def probe(path, timeout=30):
     return demuxer, duration
 
 
-def extract_audio(src, dst, max_seconds, timeout=900):
-    """Decode the first audio track of `src` into a small mp3 at `dst`."""
+def extract_wav(src, dst, max_seconds, timeout=900):
+    """Decode the first audio track of `src` to 16 kHz mono WAV at `dst`."""
     demuxer, _ = probe(src)
     cmd = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', *_LOCKDOWN,
            '-f', demuxer, '-i', str(src),
            '-map', '0:a:0', '-vn', '-sn', '-dn', '-t', str(int(max_seconds) + 1),
-           '-ac', '1', '-ar', '16000', '-c:a', 'libmp3lame', '-b:a', '48k', '-y', str(dst)]
+           '-ac', '1', '-ar', str(SAMPLE_RATE), '-c:a', 'pcm_s16le', '-y', str(dst)]
     try:
         subprocess.run(cmd, capture_output=True, check=True, timeout=timeout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logger.warning('ffmpeg failed on %s: %s', src, getattr(e, 'stderr', b'')[-500:])
         raise MediaError('오디오를 추출하지 못했어요.')
+
+
+def wav_duration(path):
+    with wave.open(str(path), 'rb') as w:
+        return w.getnframes() / w.getframerate()
+
+
+def loudness_frames(path, frame_seconds=FRAME_SECONDS):
+    """RMS level (dBFS) of each frame of a 16-bit mono WAV."""
+    levels = []
+    with wave.open(str(path), 'rb') as w:
+        size = max(1, int(w.getframerate() * frame_seconds))
+        while True:
+            raw = w.readframes(size)
+            if not raw:
+                break
+            samples = array.array('h', raw)
+            if sys.byteorder == 'big':
+                samples.byteswap()
+            power = math.sumprod(samples, samples) / len(samples)
+            # 90.31 dB = 20*log10(32768), full scale for 16-bit samples
+            levels.append(10 * math.log10(power) - 90.31 if power > 0 else -120.0)
+    return levels
+
+
+def plan_chunks(levels, total, target=12.0, min_len=5.0, max_len=20.0, frame_seconds=FRAME_SECONDS):
+    """Split [0, total] seconds into chunks of at most `max_len` seconds.
+
+    Each cut goes to the quietest moment between `min_len` and `max_len` after
+    the previous cut, nudged towards `target`, so cuts land in pauses between
+    sentences instead of in the middle of a word.
+    """
+    if total <= max_len:
+        return [(0.0, round(total, 2))]
+
+    # Average over ~250 ms; a short gap inside a word should not look like a pause
+    k = 2
+    smooth = []
+    for i in range(len(levels)):
+        window = levels[max(0, i - k):i + k + 1]
+        smooth.append(sum(window) / len(window))
+
+    cuts = [0.0]
+    while total - cuts[-1] > max_len:
+        start = cuts[-1]
+        lo = int((start + min_len) / frame_seconds)
+        hi = min(int((start + max_len) / frame_seconds), len(smooth) - 1)
+        if lo > hi:
+            cuts.append(start + max_len)
+            continue
+        best = min(range(lo, hi + 1),
+                   key=lambda i: smooth[i] + 0.5 * abs(i * frame_seconds - start - target))
+        cuts.append(round((best + 0.5) * frame_seconds, 2))
+    cuts.append(round(total, 2))
+    return list(zip(cuts, cuts[1:]))
+
+
+def wav_slice(path, start, end):
+    """Return the [start, end) part of a WAV file as WAV bytes."""
+    with wave.open(str(path), 'rb') as src:
+        rate = src.getframerate()
+        src.setpos(min(int(start * rate), src.getnframes()))
+        frames = src.readframes(max(0, int((end - start) * rate)))
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as dst:
+            dst.setnchannels(src.getnchannels())
+            dst.setsampwidth(src.getsampwidth())
+            dst.setframerate(rate)
+            dst.writeframes(frames)
+    return buf.getvalue()
 
 
 # --- YouTube ---------------------------------------------------------------

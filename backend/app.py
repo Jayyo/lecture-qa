@@ -7,7 +7,9 @@ import shutil
 import threading
 import logging
 import importlib.util
-from collections import OrderedDict
+import time
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -81,6 +83,14 @@ FEEDBACK_FROM = os.getenv('FEEDBACK_FROM')
 FEEDBACK_ENABLED = bool(PROFESSOR_EMAIL and RESEND_API_KEY and FEEDBACK_FROM)
 EMAIL_RE = re.compile(r'[^@\s<>"]{1,64}@[^@\s<>"]{1,190}\.[A-Za-z]{2,24}')
 
+# Cost and abuse limits for a public instance (0 disables a rate limit)
+JOB_WORKERS = env_int('JOB_WORKERS', 2)
+MAX_PENDING_JOBS = env_int('MAX_PENDING_JOBS', 8)
+VIDEOS_PER_HOUR = env_int('RATE_LIMIT_VIDEOS_PER_HOUR', 10)
+QUESTIONS_PER_HOUR = env_int('RATE_LIMIT_QUESTIONS_PER_HOUR', 60)
+FEEDBACK_PER_DAY = env_int('RATE_LIMIT_FEEDBACK_PER_DAY', 10)
+RETENTION_HOURS = env_int('RETENTION_HOURS', 48)
+
 # Optional offline transcription with openai-whisper (tiny, base, small, medium, large)
 USE_LOCAL_WHISPER = os.getenv('USE_LOCAL_WHISPER', 'false').lower() == 'true'
 WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'small')
@@ -99,6 +109,99 @@ transcription_status = {}
 recent_answers = OrderedDict()
 answers_lock = threading.Lock()
 MAX_RECENT_ANSWERS = 1000
+
+# Transcription jobs run on a small pool; keep transcription_status in one
+# process (gunicorn --workers 1) so status polling sees every job.
+job_pool = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix='job')
+jobs_lock = threading.Lock()
+pending_jobs = set()
+
+
+class RateLimiter:
+    """Sliding-window counter per key, kept in memory."""
+
+    def __init__(self):
+        self.hits = {}
+        self.lock = threading.Lock()
+
+    def allow(self, key, limit, window):
+        if limit <= 0:
+            return True
+        now = time.monotonic()
+        with self.lock:
+            if len(self.hits) > 10000:
+                self.hits = {k: q for k, q in self.hits.items() if q and q[-1] > now - 86400}
+            hits = self.hits.setdefault(key, deque())
+            while hits and hits[0] <= now - window:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False
+            hits.append(now)
+            return True
+
+
+limiter = RateLimiter()
+
+
+def rate_limited(bucket, limit, window):
+    """Return an error response when this client went over the limit, else None."""
+    if limiter.allow(f"{bucket}:{request.remote_addr}", limit, window):
+        return None
+    return jsonify({'error': 'rate_limited', 'message': '요청이 너무 많아요. 잠시 후 다시 시도해 주세요.'}), 429
+
+
+def queue_full():
+    with jobs_lock:
+        return len(pending_jobs) >= MAX_PENDING_JOBS
+
+
+def submit_job(video_id, title, fn, *args):
+    """Queue a background job. Returns False when the queue is full."""
+    with jobs_lock:
+        if video_id in pending_jobs:
+            return True
+        if len(pending_jobs) >= MAX_PENDING_JOBS:
+            return False
+        pending_jobs.add(video_id)
+        transcription_status[video_id] = {'status': 'queued', 'progress': 0, 'title': title}
+
+    def run():
+        try:
+            fn(*args)
+        finally:
+            with jobs_lock:
+                pending_jobs.discard(video_id)
+
+    job_pool.submit(run)
+    cleanup_old_files()
+    return True
+
+
+_last_cleanup = 0.0
+
+
+def cleanup_old_files():
+    """Delete videos and transcripts older than RETENTION_HOURS (checked every 10 minutes)."""
+    global _last_cleanup
+    now = time.time()
+    if RETENTION_HOURS <= 0 or now - _last_cleanup < 600:
+        return
+    _last_cleanup = now
+    cutoff = now - RETENTION_HOURS * 3600
+    for folder in (UPLOAD_FOLDER, TRANSCRIPT_FOLDER, WORK_FOLDER):
+        for path in folder.iterdir():
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink()
+                video_id = path.name.split('.')[0]
+                transcription_store.pop(video_id, None)
+                transcription_status.pop(video_id, None)
+            except OSError:
+                logger.warning(f"Could not remove {path}")
 
 
 def valid_video_id(video_id):
@@ -260,6 +363,11 @@ def upload_video():
         return jsonify({'error': 'No selected file'}), 400
     if Path(file.filename).suffix.lower() not in media.UPLOAD_EXTENSIONS:
         return jsonify({'error': 'unsupported', 'message': 'MP4 또는 WebM 영상만 올릴 수 있어요.'}), 400
+    if queue_full():
+        return jsonify({'error': 'busy', 'message': '지금 처리 중인 영상이 많아요. 잠시 후 다시 시도해 주세요.'}), 503
+    limited = rate_limited('videos', VIDEOS_PER_HOUR, 3600)
+    if limited:
+        return limited
 
     video_id = secrets.token_hex(16)
     tmp_path = WORK_FOLDER / f"{video_id}.upload"
@@ -278,10 +386,10 @@ def upload_video():
 
     logger.info(f"[UPLOAD] Saved | video_id: {video_id} | {duration:.0f}s | {filepath.stat().st_size/1024/1024:.2f}MB | IP: {request.remote_addr}")
 
-    # Start transcription in background
     title = Path(file.filename).stem[:100] or None
-    transcription_status[video_id] = {'status': 'processing', 'progress': 25}
-    threading.Thread(target=transcribe_audio, args=(filepath, video_id, title), daemon=True).start()
+    if not submit_job(video_id, title, transcribe_audio, filepath, video_id, title):
+        filepath.unlink(missing_ok=True)
+        return jsonify({'error': 'busy', 'message': '지금 처리 중인 영상이 많아요. 잠시 후 다시 시도해 주세요.'}), 503
 
     return jsonify({
         'video_id': video_id,
@@ -307,12 +415,15 @@ def process_youtube():
     if transcript is not None:
         return jsonify({**result, 'cached': True, 'title': transcript.get('title')})
 
-    # Someone else may have asked for the same video a moment ago
-    if transcription_status.get(video_id, {}).get('status') in ('downloading', 'processing'):
-        return jsonify(result)
-
-    transcription_status[video_id] = {'status': 'downloading', 'progress': 0}
-    threading.Thread(target=process_youtube_job, args=(youtube_id, video_id), daemon=True).start()
+    # Someone may have asked for the same video a moment ago; join that job
+    with jobs_lock:
+        if video_id in pending_jobs:
+            return jsonify(result)
+    limited = rate_limited('videos', VIDEOS_PER_HOUR, 3600)
+    if limited:
+        return limited
+    if not submit_job(video_id, None, process_youtube_job, youtube_id, video_id):
+        return jsonify({'error': 'busy', 'message': '지금 처리 중인 영상이 많아요. 잠시 후 다시 시도해 주세요.'}), 503
     return jsonify(result)
 
 
@@ -384,6 +495,9 @@ def ask_question():
     transcript = load_transcript(video_id)
     if transcript is None:
         return jsonify({'error': 'Transcript not available'}), 404
+    limited = rate_limited('questions', QUESTIONS_PER_HOUR, 3600)
+    if limited:
+        return limited
 
     prompt = qa.build_input(transcript['segments'], current_time, question,
                             history=parse_history(data.get('history')), title=transcript.get('title'))
@@ -431,6 +545,9 @@ def send_feedback():
     reply_to = str(data.get('reply_to') or '').strip()
     if reply_to and not EMAIL_RE.fullmatch(reply_to):
         return jsonify({'error': 'bad_email', 'message': '이메일 주소를 확인해 주세요.'}), 400
+    limited = rate_limited('feedback', FEEDBACK_PER_DAY, 86400)
+    if limited:
+        return limited
 
     with answers_lock:
         item = recent_answers.get(answer_id) if isinstance(answer_id, str) else None

@@ -300,6 +300,7 @@ function startJob(next) {
 }
 
 function statusText(data) {
+    if (data.status === 'queued') return '차례를 기다리는 중';
     if (data.status === 'downloading') return 'YouTube에서 오디오를 받는 중';
     if ((data.progress || 0) < 30) return '오디오를 추출하는 중';
     return '음성을 자막으로 바꾸는 중';
